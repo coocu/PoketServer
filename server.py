@@ -5,9 +5,9 @@ import secrets
 app = FastAPI()
 
 # ================================================
-#   메모리 저장 DB (원하면 SQLite 버전도 만들어줄게)
+#   메모리 저장 DB
 # ================================================
-auth_db = {}  
+auth_db = {}
 delete_password = "del1234"
 
 # ================================================
@@ -25,7 +25,6 @@ class PasswordRequest(BaseModel):
 # ================================================
 @app.post("/register")
 def register(req: CodeRequest):
-    """인증키 등록"""
     code = req.code
 
     if code not in auth_db:
@@ -36,14 +35,11 @@ def register(req: CodeRequest):
 
 @app.post("/approve")
 def approve(req: CodeRequest):
-    """관리자가 인증키 승인"""
     code = req.code
 
-    # 자동 등록
     if code not in auth_db:
         auth_db[code] = {"status": "pending", "token": None}
 
-    # 랜덤 토큰 생성
     token = secrets.token_hex(32)
     auth_db[code]["status"] = "approved"
     auth_db[code]["token"] = token
@@ -79,36 +75,30 @@ def get_delete_pwd():
 
 
 # ================================================
-#   앱 인증 API (여기가 핵심)
+#   앱 인증 API (수정됨!) 자동 삭제 없어짐
 # ================================================
 @app.post("/app/check")
 def app_check(req: CodeRequest):
     code = req.code
 
-    # 인증키가 존재하지 않으면 → 인증 불가
     if code not in auth_db:
         return {"status": "invalid"}
 
     status = auth_db[code]["status"]
     token = auth_db[code]["token"]
 
-    # 승인된 인증키라면 → token 발급 후 인증키 삭제 (1회용)
+    # 승인됨 → 바로 token 반환 (삭제 없음)
     if status == "approved" and token is not None:
-
-        # 인증키 즉시 삭제 (1회용 보안 핵심)
-        del auth_db[code]
-
         return {
             "status": "approved",
             "token": token
         }
 
-    # pending 상태
     return {"status": status}
 
 
 # ================================================
-#   앱이 삭제 비밀번호 요청 (인증과 무관)
+#   앱 삭제 비밀번호 요청
 # ================================================
 @app.get("/app/delete_password")
 def app_delete_password():
