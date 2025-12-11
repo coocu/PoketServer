@@ -7,6 +7,7 @@ import os
 app = FastAPI()
 
 DATA_FILE = "auth_data.json"
+ADMIN_PASSWORD = "Kyh5374!@#"   # 🔐 관리자 페이지 비밀번호
 
 
 # ============================================================
@@ -14,28 +15,24 @@ DATA_FILE = "auth_data.json"
 # ============================================================
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return {}, "del1234"
+        return {}
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("auth_db", {}), data.get("delete_password", "del1234")
+            return json.load(f)
     except:
-        return {}, "del1234"
+        return {}
 
 
 def save_data():
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump({
-            "auth_db": auth_db,
-            "delete_password": delete_password
-        }, f, ensure_ascii=False, indent=2)
+        json.dump(auth_db, f, ensure_ascii=False, indent=2)
 
 
 # ============================================================
 #   메모리 DB (서버 실행 시 JSON에서 복구)
 # ============================================================
-auth_db, delete_password = load_data()
+auth_db = load_data()
 
 
 # ============================================================
@@ -57,7 +54,11 @@ def register(req: CodeRequest):
     code = req.code
 
     if code not in auth_db:
-        auth_db[code] = {"status": "pending", "token": None}
+        auth_db[code] = {
+            "status": "pending",
+            "token": None,
+            "delete_password": None  # 🔥 코드별 삭제 비밀번호
+        }
         save_data()
 
     return {"code": code, "status": auth_db[code]["status"]}
@@ -68,7 +69,11 @@ def approve(req: CodeRequest):
     code = req.code
 
     if code not in auth_db:
-        auth_db[code] = {"status": "pending", "token": None}
+        auth_db[code] = {
+            "status": "pending",
+            "token": None,
+            "delete_password": None
+        }
 
     token = secrets.token_hex(32)
     auth_db[code]["status"] = "approved"
@@ -88,13 +93,11 @@ def list_codes():
 def delete(req: CodeRequest):
     code = req.code
 
-    # ALL 삭제
     if code.lower() == "all":
         auth_db.clear()
         save_data()
         return {"status": "all_deleted"}
 
-    # 개별 삭제
     if code in auth_db:
         del auth_db[code]
         save_data()
@@ -103,17 +106,32 @@ def delete(req: CodeRequest):
     return {"status": "not_found"}
 
 
+# ============================================================
+#   🔥 코드별 삭제 비밀번호 설정
+#   예: POST /set_delete_pwd?code=abc
+#       body { "password": "1234" }
+# ============================================================
 @app.post("/set_delete_pwd")
-def set_delete_pwd(req: PasswordRequest):
-    global delete_password
-    delete_password = req.password
+def set_delete_pwd(req: PasswordRequest, code: str = None):
+
+    if code is None:
+        return {"error": "code query required"}
+
+    if code not in auth_db:
+        return {"error": "code_not_found"}
+
+    auth_db[code]["delete_password"] = req.password
     save_data()
-    return {"status": "ok"}
+
+    return {"status": "ok", "code": code, "delete_password": req.password}
 
 
 @app.get("/get_delete_pwd")
-def get_delete_pwd():
-    return {"password": delete_password}
+def get_delete_pwd(code: str):
+    if code not in auth_db:
+        return {"error": "code_not_found"}
+
+    return {"password": auth_db[code].get("delete_password")}
 
 
 # ============================================================
@@ -136,48 +154,55 @@ def app_check(req: CodeRequest):
 
 
 # ============================================================
-#   앱 삭제 비밀번호
-# ============================================================
-@app.get("/app/delete_password")
-def app_delete_password():
-    return {"password": delete_password}
-
-
-# ============================================================
-#   관리자 페이지 /tokens
+#   관리자 페이지 /tokens (비밀번호 입력 추가)
 # ============================================================
 from fastapi.responses import HTMLResponse
 
 @app.get("/tokens", response_class=HTMLResponse)
-def admin_page():
-    html = f"""
+def admin_page(admin: str = None):
+
+    # 🔐 비밀번호 체크
+    if admin != ADMIN_PASSWORD:
+        return """
+        <html><head><meta charset="UTF-8">
+        <style>
+            body { background:#111; color:#eee; font-family:Arial; padding:40px; }
+            input { padding:10px; font-size:16px; }
+            button { padding:10px 20px; font-size:16px; margin-left:10px; }
+        </style>
+        </head><body>
+
+        <h2>🔐 관리자 로그인</h2>
+        <form method="get" action="/tokens">
+            <input type="password" name="admin" placeholder="비밀번호 입력"/>
+            <button type="submit">로그인</button>
+        </form>
+
+        </body></html>
+        """
+
+    # 🔥 로그인 성공 → 토큰 리스트 출력
+    html = """
     <html>
     <head>
         <meta charset="UTF-8">
         <title>Pocket Blackbox Tokens</title>
         <style>
-            body {{ font-family: Arial; background: #111; color: #eee; padding: 20px; }}
-            h1 {{ color: #4DB6AC; }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-            table, th, td {{ border: 1px solid #444; }}
-            th, td {{ padding: 10px; text-align: left; }}
-            th {{ background: #222; }}
-            tr:nth-child(even) {{ background: #1a1a1a; }}
-            .pwd {{ margin-top: 30px; padding: 10px; background: #222; border-radius: 5px; }}
+            body { font-family: Arial; background: #111; color: #eee; padding: 20px; }
+            h1 { color: #4DB6AC; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            table, th, td { border: 1px solid #444; }
+            th, td { padding: 10px; text-align: left; }
+            th { background: #222; }
+            tr:nth-child(even) { background: #1a1a1a; }
+            .pwd { margin-top: 30px; padding: 10px; background: #222; border-radius: 5px; }
         </style>
     </head>
     <body>
 
         <h1>🔐 Pocket Blackbox Admin</h1>
-
-        <div class="pwd">
-            <h2>삭제 비밀번호</h2>
-            <p><b>{delete_password}</b></p>
-        </div>
-
-        <h1>🔐 Pocket Blackbox Token List</h1>
-
         <h2>등록된 토큰 목록</h2>
+
         <table>
             <tr>
                 <th>코드</th>
@@ -191,7 +216,7 @@ def admin_page():
         html += f"""
             <tr>
                 <td>{code}</td>
-                <td>{delete_password}</td>
+                <td>{data.get('delete_password', '')}</td>
                 <td>{data['status']}</td>
                 <td>{data['token']}</td>
             </tr>
