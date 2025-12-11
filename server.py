@@ -228,7 +228,7 @@ def admin_page(admin: str = None):
     </head>
     <body>
 
-        <h1>🔐 Pocket Blackbox Admin</h1>
+        <h1>🔐 Pocket Blackbox 쿠쿠</h1>
         <h2>등록된 토큰 목록</h2>
 
         <div style="overflow-x:auto; width:100%;">  <!-- 🔥 모바일 가로 스크롤 -->
