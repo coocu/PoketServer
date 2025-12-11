@@ -34,6 +34,10 @@ def save_data():
 # ============================================================
 auth_db = load_data()
 
+# 🔥 관리자 앱 / 포켓 앱에서 마지막으로 사용한 코드 기억용
+last_admin_code: str | None = None
+last_app_code: str | None = None
+
 
 # ============================================================
 #   요청 모델
@@ -51,7 +55,9 @@ class PasswordRequest(BaseModel):
 # ============================================================
 @app.post("/register")
 def register(req: CodeRequest):
+    global last_admin_code
     code = req.code
+    last_admin_code = code
 
     if code not in auth_db:
         auth_db[code] = {
@@ -66,7 +72,9 @@ def register(req: CodeRequest):
 
 @app.post("/approve")
 def approve(req: CodeRequest):
+    global last_admin_code
     code = req.code
+    last_admin_code = code
 
     if code not in auth_db:
         auth_db[code] = {
@@ -108,22 +116,27 @@ def delete(req: CodeRequest):
 
 # ============================================================
 #   🔥 코드별 삭제 비밀번호 설정
-#   예: POST /set_delete_pwd?code=abc
-#       body { "password": "1234" }
+#   Admin 앱: POST /set_delete_pwd  (body { "password": "1234" })
+#   → 마지막으로 register/approve한 코드(last_admin_code)에 저장
 # ============================================================
 @app.post("/set_delete_pwd")
-def set_delete_pwd(req: PasswordRequest, code: str = None):
+def set_delete_pwd(req: PasswordRequest):
+    global last_admin_code
 
-    if code is None:
-        return {"error": "code query required"}
+    if last_admin_code is None:
+        return {"error": "no_last_code"}
 
-    if code not in auth_db:
+    if last_admin_code not in auth_db:
         return {"error": "code_not_found"}
 
-    auth_db[code]["delete_password"] = req.password
+    auth_db[last_admin_code]["delete_password"] = req.password
     save_data()
 
-    return {"status": "ok", "code": code, "delete_password": req.password}
+    return {
+        "status": "ok",
+        "code": last_admin_code,
+        "delete_password": req.password
+    }
 
 
 @app.get("/get_delete_pwd")
@@ -139,6 +152,7 @@ def get_delete_pwd(code: str):
 # ============================================================
 @app.post("/app/check")
 def app_check(req: CodeRequest):
+    global last_app_code
     code = req.code
 
     if code not in auth_db:
@@ -148,9 +162,26 @@ def app_check(req: CodeRequest):
     token = auth_db[code]["token"]
 
     if status == "approved" and token is not None:
+        # 🔥 포켓 블랙박스 앱에서 마지막으로 인증한 코드 기억
+        last_app_code = code
         return {"status": "approved", "token": token}
 
     return {"status": status}
+
+
+# 🔥 포켓 블랙박스 앱이 사용하는 삭제 비밀번호 API
+# GET /app/delete_password
+# → 마지막으로 /app/check 에서 approved 받은 코드(last_app_code)의 비밀번호 반환
+@app.get("/app/delete_password")
+def app_delete_password():
+    if last_app_code is None:
+        return {"password": None}
+
+    data = auth_db.get(last_app_code)
+    if not data:
+        return {"password": None}
+
+    return {"password": data.get("delete_password")}
 
 
 # ============================================================
