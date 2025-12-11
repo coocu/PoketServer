@@ -146,6 +146,7 @@ def app_delete_password():
 # ============================================================
 #   관리자 페이지 /tokens — format 제거됨 (오류 없음)
 # ============================================================
+
 from fastapi.responses import HTMLResponse
 
 @app.get("/tokens", response_class=HTMLResponse)
@@ -163,21 +164,16 @@ def admin_page():
             th, td {{ padding: 10px; text-align: left; }}
             th {{ background: #222; }}
             tr:nth-child(even) {{ background: #1a1a1a; }}
-            .pwd {{ margin-top: 30px; padding: 10px; background: #222; border-radius: 5px; }}
         </style>
     </head>
     <body>
-        <h1>🔐 Pocket Blackbox Admin</h1>
-
-        <div class="pwd">
-            <h2>삭제 비밀번호</h2>
-            <p><b>{delete_password}</b></p>
-        </div>
+        <h1>🔐 Pocket Blackbox Token List</h1>
 
         <h2>등록된 토큰 목록</h2>
         <table>
             <tr>
                 <th>코드</th>
+                <th>삭제 비밀번호</th>
                 <th>상태</th>
                 <th>토큰</th>
             </tr>
@@ -187,6 +183,7 @@ def admin_page():
         html += f"""
         <tr>
             <td>{code}</td>
+            <td>{delete_password}</td>
             <td>{data['status']}</td>
             <td>{data['token']}</td>
         </tr>
