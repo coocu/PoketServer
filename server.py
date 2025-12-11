@@ -19,7 +19,7 @@ def load_data():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data.get("auth_db", {}), data.get("delete_password", "del1234")
+        return data.get("auth_db", {}), data.get("delete_password", "del1234")
     except:
         return {}, "del1234"
 
@@ -43,6 +43,7 @@ auth_db, delete_password = load_data()
 # ============================================================
 class CodeRequest(BaseModel):
     code: str
+
 
 class PasswordRequest(BaseModel):
     password: str
@@ -142,15 +143,23 @@ def app_delete_password():
     return {"password": delete_password}
 
 
-
 # ============================================================
-#   관리자 페이지 /tokens — format 제거됨 (오류 없음)
+#   관리자 페이지 /tokens
 # ============================================================
-
 from fastapi.responses import HTMLResponse
 
 @app.get("/tokens", response_class=HTMLResponse)
-@@ -163,21 +164,16 @@
+def admin_page():
+    html = f"""
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Pocket Blackbox Tokens</title>
+        <style>
+            body {{ font-family: Arial; background: #111; color: #eee; padding: 20px; }}
+            h1 {{ color: #4DB6AC; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+            table, th, td {{ border: 1px solid #444; }}
             th, td {{ padding: 10px; text-align: left; }}
             th {{ background: #222; }}
             tr:nth-child(even) {{ background: #1a1a1a; }}
@@ -158,12 +167,14 @@ from fastapi.responses import HTMLResponse
         </style>
     </head>
     <body>
+
         <h1>🔐 Pocket Blackbox Admin</h1>
 
         <div class="pwd">
             <h2>삭제 비밀번호</h2>
             <p><b>{delete_password}</b></p>
         </div>
+
         <h1>🔐 Pocket Blackbox Token List</h1>
 
         <h2>등록된 토큰 목록</h2>
@@ -174,14 +185,16 @@ from fastapi.responses import HTMLResponse
                 <th>상태</th>
                 <th>토큰</th>
             </tr>
-@@ -187,16 +183,17 @@
+    """
+
+    for code, data in auth_db.items():
         html += f"""
-        <tr>
-            <td>{code}</td>
-            <td>{delete_password}</td>
-            <td>{data['status']}</td>
-            <td>{data['token']}</td>
-        </tr>
+            <tr>
+                <td>{code}</td>
+                <td>{delete_password}</td>
+                <td>{data['status']}</td>
+                <td>{data['token']}</td>
+            </tr>
         """
 
     html += """
