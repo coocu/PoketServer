@@ -147,3 +147,58 @@ def app_check(req: CodeRequest):
 @app.get("/app/delete_password")
 def app_delete_password():
     return {"password": delete_password}
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/tokens", response_class=HTMLResponse)
+def admin_page():
+    html = """
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Admin Page</title>
+        <style>
+            body { font-family: Arial; background: #111; color: #eee; padding: 20px; }
+            h1 { color: #4DB6AC; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            table, th, td { border: 1px solid #444; }
+            th, td { padding: 10px; text-align: left; }
+            th { background: #222; }
+            tr:nth-child(even) { background: #1a1a1a; }
+            .pwd { margin-top: 30px; padding: 10px; background: #222; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <h1>🔐 Pocket Blackbox Admin</h1>
+
+        <div class="pwd">
+            <h2>삭제 비밀번호</h2>
+            <p><b>{delete_password}</b></p>
+        </div>
+
+        <h2>등록된 토큰 목록</h2>
+        <table>
+            <tr>
+                <th>코드</th>
+                <th>상태</th>
+                <th>토큰</th>
+            </tr>
+    """.format(delete_password=delete_password)
+
+    for code, data in auth_db.items():
+        html += f"""
+        <tr>
+            <td>{code}</td>
+            <td>{data['status']}</td>
+            <td>{data['token']}</td>
+        </tr>
+        """
+
+    html += """
+        </table>
+        <p style="margin-top:50px; color:#777">© Pocket Blackbox Admin Interface</p>
+    </body>
+    </html>
+    """
+
+    return html
