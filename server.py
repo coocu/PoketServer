@@ -10,7 +10,7 @@ DATA_FILE = "auth_data.json"
 
 
 # ============================================================
-#   JSON 저장/로드 기능 (추가된 부분)
+#   JSON 저장/로드 기능
 # ============================================================
 def load_data():
     if not os.path.exists(DATA_FILE):
@@ -33,7 +33,7 @@ def save_data():
 
 
 # ============================================================
-#   메모리 DB (서버 실행 시 JSON에서 자동 복구됨)
+#   메모리 DB (서버 실행 시 JSON에서 복구)
 # ============================================================
 auth_db, delete_password = load_data()
 
@@ -49,7 +49,7 @@ class PasswordRequest(BaseModel):
 
 
 # ============================================================
-#   관리자 API — 기존 로직 유지
+#   관리자 API
 # ============================================================
 @app.post("/register")
 def register(req: CodeRequest):
@@ -87,17 +87,13 @@ def list_codes():
 def delete(req: CodeRequest):
     code = req.code
 
-    # ===============================================
-    # 1) ALL 삭제 기능 추가 (보안 중요)
-    # ===============================================
+    # ALL 삭제
     if code.lower() == "all":
         auth_db.clear()
         save_data()
         return {"status": "all_deleted"}
 
-    # ===============================================
-    # 2) 기존 기능 유지 — 단일 코드 삭제
-    # ===============================================
+    # 개별 삭제
     if code in auth_db:
         del auth_db[code]
         save_data()
@@ -120,7 +116,7 @@ def get_delete_pwd():
 
 
 # ============================================================
-#   앱 인증 API — 기존 로직 절대 변경 없음
+#   앱 인증 API
 # ============================================================
 @app.post("/app/check")
 def app_check(req: CodeRequest):
@@ -133,39 +129,41 @@ def app_check(req: CodeRequest):
     token = auth_db[code]["token"]
 
     if status == "approved" and token is not None:
-        return {
-            "status": "approved",
-            "token": token
-        }
+        return {"status": "approved", "token": token}
 
     return {"status": status}
 
 
 # ============================================================
-#   앱 삭제 비밀번호 요청 — 기존 로직 유지
+#   앱 삭제 비밀번호
 # ============================================================
 @app.get("/app/delete_password")
 def app_delete_password():
     return {"password": delete_password}
 
+
+
+# ============================================================
+#   관리자 페이지 /tokens — format 제거됨 (오류 없음)
+# ============================================================
 from fastapi.responses import HTMLResponse
 
 @app.get("/tokens", response_class=HTMLResponse)
 def admin_page():
-    html = """
+    html = f"""
     <html>
     <head>
         <meta charset="UTF-8">
-        <title>Admin Page</title>
+        <title>Pocket Blackbox Tokens</title>
         <style>
-            body { font-family: Arial; background: #111; color: #eee; padding: 20px; }
-            h1 { color: #4DB6AC; }
-            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-            table, th, td { border: 1px solid #444; }
-            th, td { padding: 10px; text-align: left; }
-            th { background: #222; }
-            tr:nth-child(even) { background: #1a1a1a; }
-            .pwd { margin-top: 30px; padding: 10px; background: #222; border-radius: 5px; }
+            body {{ font-family: Arial; background: #111; color: #eee; padding: 20px; }}
+            h1 {{ color: #4DB6AC; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+            table, th, td {{ border: 1px solid #444; }}
+            th, td {{ padding: 10px; text-align: left; }}
+            th {{ background: #222; }}
+            tr:nth-child(even) {{ background: #1a1a1a; }}
+            .pwd {{ margin-top: 30px; padding: 10px; background: #222; border-radius: 5px; }}
         </style>
     </head>
     <body>
@@ -183,7 +181,7 @@ def admin_page():
                 <th>상태</th>
                 <th>토큰</th>
             </tr>
-    """.format(delete_password=delete_password)
+    """
 
     for code, data in auth_db.items():
         html += f"""
@@ -196,7 +194,7 @@ def admin_page():
 
     html += """
         </table>
-        <p style="margin-top:50px; color:#777">© Pocket Blackbox Admin Interface</p>
+        <p style="margin-top:50px; color:#777">© Pocket Blackbox Token Interface</p>
     </body>
     </html>
     """
