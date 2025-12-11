@@ -63,7 +63,7 @@ def register(req: CodeRequest):
         auth_db[code] = {
             "status": "pending",
             "token": None,
-            "delete_password": None  # 🔥 코드별 삭제 비밀번호
+            "delete_password": None
         }
         save_data()
 
@@ -116,8 +116,6 @@ def delete(req: CodeRequest):
 
 # ============================================================
 #   🔥 코드별 삭제 비밀번호 설정
-#   Admin 앱: POST /set_delete_pwd  (body { "password": "1234" })
-#   → 마지막으로 register/approve한 코드(last_admin_code)에 저장
 # ============================================================
 @app.post("/set_delete_pwd")
 def set_delete_pwd(req: PasswordRequest):
@@ -162,16 +160,12 @@ def app_check(req: CodeRequest):
     token = auth_db[code]["token"]
 
     if status == "approved" and token is not None:
-        # 🔥 포켓 블랙박스 앱에서 마지막으로 인증한 코드 기억
         last_app_code = code
         return {"status": "approved", "token": token}
 
     return {"status": status}
 
 
-# 🔥 포켓 블랙박스 앱이 사용하는 삭제 비밀번호 API
-# GET /app/delete_password
-# → 마지막으로 /app/check 에서 approved 받은 코드(last_app_code)의 비밀번호 반환
 @app.get("/app/delete_password")
 def app_delete_password():
     if last_app_code is None:
@@ -185,14 +179,14 @@ def app_delete_password():
 
 
 # ============================================================
-#   관리자 페이지 /tokens (비밀번호 입력 추가)
+#   관리자 페이지 /tokens (비밀번호 입력 + 모바일 최적화)
 # ============================================================
 from fastapi.responses import HTMLResponse
 
 @app.get("/tokens", response_class=HTMLResponse)
 def admin_page(admin: str = None):
 
-    # 🔐 비밀번호 체크
+    # 🔐 로그인 여부 확인
     if admin != ADMIN_PASSWORD:
         return """
         <html><head><meta charset="UTF-8">
@@ -212,7 +206,7 @@ def admin_page(admin: str = None):
         </body></html>
         """
 
-    # 🔥 로그인 성공 → 토큰 리스트 출력
+    # 🔥 목록 출력 페이지
     html = """
     <html>
     <head>
@@ -223,10 +217,13 @@ def admin_page(admin: str = None):
             h1 { color: #4DB6AC; }
             table { width: 100%; border-collapse: collapse; margin-top: 20px; }
             table, th, td { border: 1px solid #444; }
-            th, td { padding: 10px; text-align: left; }
+            th, td { 
+                padding: 10px; 
+                text-align: left;
+                white-space: nowrap; /* 🔥 모바일 줄바꿈 방지 */
+            }
             th { background: #222; }
             tr:nth-child(even) { background: #1a1a1a; }
-            .pwd { margin-top: 30px; padding: 10px; background: #222; border-radius: 5px; }
         </style>
     </head>
     <body>
@@ -234,6 +231,7 @@ def admin_page(admin: str = None):
         <h1>🔐 Pocket Blackbox Admin</h1>
         <h2>등록된 토큰 목록</h2>
 
+        <div style="overflow-x:auto; width:100%;">  <!-- 🔥 모바일 가로 스크롤 -->
         <table>
             <tr>
                 <th>코드</th>
@@ -255,6 +253,8 @@ def admin_page(admin: str = None):
 
     html += """
         </table>
+        </div>
+
         <p style="margin-top:50px; color:#777">© Pocket Blackbox Token Interface</p>
     </body>
     </html>
