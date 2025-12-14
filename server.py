@@ -11,7 +11,7 @@ from openpyxl import Workbook
 app = FastAPI()
 
 DATA_FILE = "auth_data.json"
-ADMIN_PASSWORD = "Kyh5374!@#"
+ADMIN_PASSWORD = "Kim86110!@"
 
 
 # ============================================================
