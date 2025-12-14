@@ -55,6 +55,12 @@ class RegisterRequest(BaseModel):
     code: str
 
 
+# 🔥 추가: 사용자 기준 삭제 요청
+class UserDeleteRequest(BaseModel):
+    name: str
+    phoneLast4: str
+
+
 # ============================================================
 #   관리자 API
 # ============================================================
@@ -117,6 +123,31 @@ def delete(req: CodeRequest):
     return {"status": "not_found"}
 
 
+# ============================================================
+#   🔥 추가: 앱용 사용자 기준 삭제 API
+# ============================================================
+@app.post("/delete_by_user")
+def delete_by_user(req: UserDeleteRequest):
+    target_code = None
+
+    for code, data in auth_db.items():
+        if data.get("name") == req.name and data.get("phone") == req.phoneLast4:
+            target_code = code
+            break
+
+    if not target_code:
+        return {"status": "not_found"}
+
+    del auth_db[target_code]
+    save_data()
+
+    return {
+        "status": "deleted",
+        "name": req.name,
+        "phone": req.phoneLast4
+    }
+
+
 @app.post("/set_delete_pwd")
 def set_delete_pwd(req: PasswordRequest):
     global last_admin_code
@@ -134,7 +165,7 @@ def set_delete_pwd(req: PasswordRequest):
 
 
 # ============================================================
-#   앱 인증 API (그대로)
+#   앱 인증 API (변경 없음)
 # ============================================================
 @app.post("/app/check")
 def app_check(req: CodeRequest):
@@ -160,7 +191,7 @@ def app_delete_password():
 
 
 # ============================================================
-#   📥 엑셀 다운로드
+#   📥 엑셀 다운로드 (변경 없음)
 # ============================================================
 @app.get("/tokens/export")
 def export_excel(admin: str):
@@ -193,7 +224,7 @@ def export_excel(admin: str):
 
 
 # ============================================================
-#   관리자 페이지
+#   관리자 페이지 (변경 없음)
 # ============================================================
 @app.get("/tokens", response_class=HTMLResponse)
 def admin_page(admin: str = None):
@@ -221,7 +252,7 @@ def admin_page(admin: str = None):
             th, td {
                 border:1px solid #444;
                 padding:10px;
-                white-space: nowrap; /* 🔥 줄바꿈 방지 */
+                white-space: nowrap;
             }
             th { background:#222; }
             tr:nth-child(even){background:#1a1a1a;}
