@@ -12,6 +12,11 @@ app = FastAPI()
 DATA_FILE = "auth_data.json"
 ADMIN_PASSWORD = "Kim86110!@"
 
+# 항상 활성 인증키
+ALWAYS_ACTIVE_KEYS = {
+    "google-playstore-sign.key",
+    "test.kyh"
+}
 
 # ============================================================
 #   JSON 저장/로드
@@ -195,6 +200,11 @@ def app_check(req: CodeRequest):
 
     if data["status"] == "approved" and data["token"]:
         last_app_code = code
+
+        # 1회용 인증키 → 인증 후 바로 휴지통 이동
+        if code not in ALWAYS_ACTIVE_KEYS:
+            move_to_trash(code)
+
         return {"status": "approved", "token": data["token"]}
 
     return {"status": data["status"]}
@@ -240,6 +250,7 @@ def export_excel(admin: str):
         filename="PocketBlackbox_Tokens.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
 
 
 # ============================================================

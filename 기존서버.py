@@ -3,8 +3,7 @@ from pydantic import BaseModel
 import secrets
 import json
 import os
-from datetime import datetime
-
+from datetime import datetime, timedelta
 from fastapi.responses import HTMLResponse, FileResponse
 from openpyxl import Workbook
 
@@ -22,7 +21,11 @@ def load_data():
         return {}
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            for k in data:
+                if "deletedAt" not in data[k]:
+                    data[k]["deletedAt"] = None
+            return data
     except:
         return {}
 
@@ -55,14 +58,38 @@ class RegisterRequest(BaseModel):
     code: str
 
 
-# 🔥 추가: 사용자 기준 삭제 요청
 class UserDeleteRequest(BaseModel):
     name: str
     phoneLast4: str
 
 
 # ============================================================
-#   관리자 API
+#   휴지통 유틸
+# ============================================================
+def move_to_trash(code):
+    auth_db[code]["deletedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_data()
+
+
+def purge_trash():
+    now = datetime.now()
+    remove = []
+    for code, d in auth_db.items():
+        if d.get("deletedAt"):
+            deleted = datetime.strptime(d["deletedAt"], "%Y-%m-%d %H:%M")
+            if now - deleted > timedelta(days=180):
+                remove.append(code)
+    for c in remove:
+        del auth_db[c]
+    if remove:
+        save_data()
+
+
+purge_trash()
+
+
+# ============================================================
+#   관리자 API (기존 유지)
 # ============================================================
 @app.post("/register")
 def register(req: RegisterRequest):
@@ -77,7 +104,8 @@ def register(req: RegisterRequest):
             "phone": req.phoneLast4,
             "status": "pending",
             "token": None,
-            "delete_password": None
+            "delete_password": None,
+            "deletedAt": None
         }
         save_data()
 
@@ -111,41 +139,26 @@ def delete(req: CodeRequest):
     code = req.code
 
     if code.lower() == "all":
-        auth_db.clear()
+        for c in auth_db:
+            auth_db[c]["deletedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         save_data()
-        return {"status": "all_deleted"}
+        return {"status": "all_moved_to_trash"}
 
     if code in auth_db:
-        del auth_db[code]
-        save_data()
-        return {"status": "deleted"}
+        move_to_trash(code)
+        return {"status": "moved_to_trash"}
 
     return {"status": "not_found"}
 
 
-# ============================================================
-#   🔥 추가: 앱용 사용자 기준 삭제 API
-# ============================================================
 @app.post("/delete_by_user")
 def delete_by_user(req: UserDeleteRequest):
-    target_code = None
-
     for code, data in auth_db.items():
         if data.get("name") == req.name and data.get("phone") == req.phoneLast4:
-            target_code = code
-            break
+            move_to_trash(code)
+            return {"status": "moved_to_trash"}
 
-    if not target_code:
-        return {"status": "not_found"}
-
-    del auth_db[target_code]
-    save_data()
-
-    return {
-        "status": "deleted",
-        "name": req.name,
-        "phone": req.phoneLast4
-    }
+    return {"status": "not_found"}
 
 
 @app.post("/set_delete_pwd")
@@ -165,7 +178,7 @@ def set_delete_pwd(req: PasswordRequest):
 
 
 # ============================================================
-#   앱 인증 API (변경 없음)
+#   앱 인증 API (기존 + 삭제 차단만 추가)
 # ============================================================
 @app.post("/app/check")
 def app_check(req: CodeRequest):
@@ -176,6 +189,10 @@ def app_check(req: CodeRequest):
         return {"status": "invalid"}
 
     data = auth_db[code]
+
+    if data.get("deletedAt"):
+        return {"status": "deleted"}
+
     if data["status"] == "approved" and data["token"]:
         last_app_code = code
         return {"status": "approved", "token": data["token"]}
@@ -191,7 +208,7 @@ def app_delete_password():
 
 
 # ============================================================
-#   📥 엑셀 다운로드 (변경 없음)
+#   엑셀 다운로드 (기존 유지)
 # ============================================================
 @app.get("/tokens/export")
 def export_excel(admin: str):
@@ -205,6 +222,8 @@ def export_excel(admin: str):
     ws.append(["날짜", "성함", "전화번호", "인증키", "비밀번호"])
 
     for code, d in auth_db.items():
+        if d.get("deletedAt"):
+            continue
         ws.append([
             d.get("date", ""),
             d.get("name", ""),
@@ -224,7 +243,38 @@ def export_excel(admin: str):
 
 
 # ============================================================
-#   관리자 페이지 (변경 없음)
+#   휴지통 API
+# ============================================================
+@app.get("/trash")
+def trash(admin: str):
+    if admin != ADMIN_PASSWORD:
+        return {"error": "unauthorized"}
+
+    return {c: d for c, d in auth_db.items() if d.get("deletedAt")}
+
+
+@app.get("/restore")
+def restore(code: str, admin: str):
+    if admin != ADMIN_PASSWORD:
+        return "Unauthorized"
+
+    if code not in auth_db:
+        return "Not found"
+
+    auth_db[code]["deletedAt"] = None
+    save_data()
+
+    return f"""
+    <html><meta charset="UTF-8">
+    <body style="background:#111;color:#0f0;padding:40px">
+    <h2>복원 완료</h2>
+    <a href="/tokens?admin={ADMIN_PASSWORD}">돌아가기</a>
+    </body></html>
+    """
+
+
+# ============================================================
+#   관리자 페이지 (기존 + 휴지통 테이블 추가)
 # ============================================================
 @app.get("/tokens", response_class=HTMLResponse)
 def admin_page(admin: str = None):
@@ -264,7 +314,7 @@ def admin_page(admin: str = None):
     <h1>🔐 Pocket Blackbox 관리자</h1>
     <a href="/tokens/export?admin=""" + ADMIN_PASSWORD + """">📥 엑셀 다운로드</a>
 
-    <div style="overflow-x:auto;margin-top:20px;">
+    <h2>📌 활성 인증키</h2>
     <table>
         <tr>
             <th>날짜</th>
@@ -276,6 +326,8 @@ def admin_page(admin: str = None):
     """
 
     for code, d in auth_db.items():
+        if d.get("deletedAt"):
+            continue
         html += f"""
         <tr>
             <td>{d.get("date","")}</td>
@@ -288,10 +340,34 @@ def admin_page(admin: str = None):
 
     html += """
     </table>
-    </div>
 
-    </body>
-    </html>
+    <h2 style="margin-top:40px;">🗑 휴지통</h2>
+    <table>
+        <tr>
+            <th>삭제일</th>
+            <th>성함</th>
+            <th>전화번호</th>
+            <th>인증키</th>
+            <th>복원</th>
+        </tr>
+    """
+
+    for code, d in auth_db.items():
+        if not d.get("deletedAt"):
+            continue
+        html += f"""
+        <tr>
+            <td>{d.get("deletedAt")}</td>
+            <td>{d.get("name","")}</td>
+            <td>{d.get("phone","")}</td>
+            <td>{code}</td>
+            <td><a href="/restore?admin={ADMIN_PASSWORD}&code={code}">복원</a></td>
+        </tr>
+        """
+
+    html += """
+    </table>
+    </body></html>
     """
 
     return html
