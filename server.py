@@ -201,14 +201,15 @@ def app_check(req: CodeRequest):
     if data["status"] == "approved" and data["token"]:
         last_app_code = code
 
-        # 1회용 인증키 → 인증 후 바로 휴지통 이동
+        result = {"status": "approved", "token": data["token"]}
+
+        # 1회 인증키 → 인증 후 바로 휴지통 이동
         if code not in ALWAYS_ACTIVE_KEYS:
             move_to_trash(code)
 
-        return {"status": "approved", "token": data["token"]}
+        return result
 
     return {"status": data["status"]}
-
 
 @app.get("/app/delete_password")
 def app_delete_password():
