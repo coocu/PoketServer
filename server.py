@@ -204,7 +204,7 @@ def app_check(req: CodeRequest):
         result = {"status": "approved", "token": data["token"]}
 
         # 1회 인증키 → 인증 후 바로 휴지통 이동
-        if code not in ALWAYS_ACTIVE_KEYS and not code.startswith("#"):
+    if code not in ALWAYS_ACTIVE_KEYS and not code.startswith("#"):
         move_to_trash(code)
 
         return result
