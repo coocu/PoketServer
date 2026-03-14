@@ -190,10 +190,6 @@ def app_check(req: CodeRequest):
     global last_app_code
     code = req.code
 
- # 마스터키 / #키 즉시 승인
-    if code in ALWAYS_ACTIVE_KEYS or code.startswith("#"):
-        return {"status": "approved", "token": "permanent"}
-
     if code not in auth_db:
         return {"status": "invalid"}
 
@@ -207,7 +203,7 @@ def app_check(req: CodeRequest):
 
         result = {"status": "approved", "token": data["token"]}
 
-        # 1회 인증키 → 인증 후 바로 휴지통 이동
+        # 일반 인증키만 1회 사용
         if code not in ALWAYS_ACTIVE_KEYS and not code.startswith("#"):
             move_to_trash(code)
 
