@@ -442,9 +442,14 @@ def app_check(req: CodeRequest):
             last_app_code = code
             result = {"status": "approved", "token": data["token"]}
 
-            # 기존 1회 사용 로직 그대로 유지
+            # 일반 인증키만 인증 성공 즉시 비활성화합니다.
+            # 기존 예외 규칙은 그대로 유지합니다:
+            # - ALWAYS_ACTIVE_KEYS에 등록된 인증키
+            # - #으로 시작하는 인증키
+            # 위 예외 인증키는 인증 후에도 활성 상태를 유지합니다.
             if code not in ALWAYS_ACTIVE_KEYS and not code.startswith("#"):
-                move_to_trash(code)
+                data["enabled"] = False
+                save_data()
 
             return result
 
@@ -830,7 +835,7 @@ input,select,button{font:inherit;border-radius:11px;border:1px solid #555;backgr
 label{display:block;font-size:13px;color:#aaa;margin:10px 0 5px}h1,h2,h3{margin-top:0}.spacer{height:8px}
 </style></head>
 <body><div class="wrap">
-<div id="loginCard" class="card"><h2>🔐 관리자 로그인</h2><p class="muted">서버에 등록된 인증키 중 <b>kyh</b> 문구가 포함된 승인 인증키만 로그인할 수 있습니다.</p><div class="row"><input id="loginCode" class="grow" type="password" placeholder="인증키"><button class="primary" onclick="login()">로그인</button></div><p id="loginMsg" class="deleted"></p></div>
+<div id="loginCard" class="card"><h2>🔐 관리자 로그인</h2><div class="row"><input id="loginCode" class="grow" type="password" placeholder="인증키"><button class="primary" onclick="login()">로그인</button></div><p id="loginMsg" class="deleted"></p></div>
 <div id="app" class="hidden">
 <div class="row" style="justify-content:space-between;align-items:center"><h1>Poket 인증 관리자</h1><div class="row"><button onclick="location.href='/admin/api/export-json'">JSON 백업</button><button onclick="logout()">로그아웃</button></div></div>
 <div class="card"><h2>인증키 등록</h2><div class="row"><input id="rName" class="grow" placeholder="성함"><input id="rPhone" class="grow" inputmode="numeric" maxlength="4" placeholder="전화번호 끝 4자리"></div><div class="row" style="margin-top:10px"><select id="rCategory" class="grow"></select><button onclick="addCategory()">+ 카테고리 추가</button></div><div class="row" style="margin-top:10px"><input id="rCode" class="grow" placeholder="인증키"><input id="rPwd" class="grow" placeholder="삭제 비밀번호"></div><div class="row" style="margin-top:10px"><button class="primary" onclick="registerCode()">서버 업로드</button><button onclick="clearRegister()">입력값 지우기</button></div></div>
@@ -842,7 +847,7 @@ let items=[], categories=['미지정'], selectedCategory='전체', selected=null
 async function api(path,opt={}){let r=await fetch(path,{headers:{'Content-Type':'application/json',...(opt.headers||{})},...opt});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));return data}
 async function boot(){try{let s=await api('/admin/api/session');if(s.loggedIn){showApp();await refresh()}}catch(e){}}
 function showApp(){loginCard.classList.add('hidden');app.classList.remove('hidden')}
-async function login(){try{await api('/admin/api/login',{method:'POST',body:JSON.stringify({code:loginCode.value.trim()})});loginMsg.textContent='';showApp();await refresh()}catch(e){loginMsg.textContent='로그인 실패: 서버에 등록된 kyh 포함 승인 인증키인지 확인하세요.'}}
+async function login(){try{await api('/admin/api/login',{method:'POST',body:JSON.stringify({code:loginCode.value.trim()})});loginMsg.textContent='';showApp();await refresh()}catch(e){loginMsg.textContent='로그인 실패';}}
 async function logout(){await api('/admin/api/logout',{method:'POST'});location.reload()}
 async function refresh(){let [l,c]=await Promise.all([api('/admin/api/list'),api('/admin/api/categories')]);items=l.items||[];categories=c.categories||['미지정'];fillCategories();renderTabs();renderList()}
 function fillCategories(){rCategory.innerHTML=categories.map(c=>`<option>${esc(c)}</option>`).join('')}
