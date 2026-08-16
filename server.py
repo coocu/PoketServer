@@ -200,10 +200,12 @@ def validate_phone(phone: str):
 
 
 def move_to_trash(code):
+    # 호환성을 위해 함수명은 유지하지만, 이제 삭제 요청은 서버에서 즉시 완전 삭제합니다.
+    # 기존 API 경로와 호출부는 그대로 유지됩니다.
     with _db_lock:
         if code not in auth_db:
             return False
-        auth_db[code]["deletedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        del auth_db[code]
         save_data()
         return True
 
@@ -378,9 +380,9 @@ def delete(req: CodeRequest):
 
     if code.lower() == "all":
         with _db_lock:
-            for c in auth_db:
-                auth_db[c]["deletedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            auth_db.clear()
             save_data()
+        # 기존 클라이언트 호환을 위해 응답 status 문자열은 유지합니다.
         return {"status": "all_moved_to_trash"}
 
     if move_to_trash(code):
@@ -863,7 +865,7 @@ async function changeCategory(){if(!selected)return;let n=prompt('변경할 카�
 async function activateSelected(){if(!selected)return;await api('/admin/api/activate',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
 async function deactivateSelected(){if(!selected)return;await api('/admin/api/deactivate',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
 async function editSelected(){if(!selected)return;let name=prompt('성함',selected.name||'');if(name===null)return;let phone=prompt('전화번호 끝 4자리',selected.phone||'');if(phone===null)return;let code=prompt('인증키',selected.code);if(code===null)return;let pwd=prompt('삭제 비밀번호',selected.delete_password||'');if(pwd===null)return;let cat=prompt('카테고리',selected.category||'미지정');if(cat===null)return;await api('/admin/api/update',{method:'POST',body:JSON.stringify({originalCode:selected.code,name:name.trim(),phoneLast4:phone.trim(),code:code.trim(),deletePassword:pwd,category:cat.trim()||'미지정'})});closeModal();await refresh()}
-async function deleteSelected(){if(!selected||!confirm('이 인증키를 휴지통으로 이동할까요?'))return;await api('/admin/api/delete',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
+async function deleteSelected(){if(!selected||!confirm('이 인증키를 서버에서 완전히 삭제할까요?\n삭제 후에는 복구할 수 없습니다.'))return;await api('/admin/api/delete',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
 async function registerCode(){let o={name:rName.value.trim(),phoneLast4:rPhone.value.trim(),category:rCategory.value||'미지정',code:rCode.value.trim(),deletePassword:rPwd.value};if(!o.name||!/^[0-9]{4}$/.test(o.phoneLast4)||!o.code||!o.deletePassword){alert('성함 / 전화번호 4자리 / 인증키 / 비밀번호를 모두 입력하세요.');return}try{await api('/admin/api/register',{method:'POST',body:JSON.stringify(o)});clearRegister();await refresh();alert('업로드 완료')}catch(e){alert('업로드 실패: '+e.message)}}
 function clearRegister(){rName.value='';rPhone.value='';rCode.value='';rPwd.value='';rCategory.value='미지정'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
