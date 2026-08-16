@@ -5,10 +5,12 @@ import json
 import os
 import shutil
 import threading
+import io
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from openpyxl import Workbook
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -159,6 +161,11 @@ class CategoryRequest(BaseModel):
     name: str
 
 
+class CategoryRenameRequest(BaseModel):
+    oldName: str
+    newName: str
+
+
 class CodeCategoryRequest(BaseModel):
     code: str
     category: str = "미지정"
@@ -287,6 +294,234 @@ def set_category_for_code(code: str, category: str):
             save_categories()
         save_data()
         return auth_db[code]
+
+
+def rename_category_and_reassign(old_name: str, new_name: str) -> int:
+    """PC 웹 관리자 전용 카테고리 이름 수정.
+    해당 카테고리의 인증키는 그대로 유지하고 category 값만 새 이름으로 변경합니다.
+    새 이름이 이미 존재하면 그 카테고리로 병합합니다.
+    """
+    old_name = clean_category(old_name)
+    new_name = clean_category(new_name)
+
+    if old_name == "미지정":
+        raise HTTPException(status_code=400, detail="cannot_rename_unspecified")
+    if new_name == "미지정":
+        raise HTTPException(status_code=400, detail="cannot_rename_to_unspecified")
+    if old_name == new_name:
+        return 0
+
+    with _db_lock:
+        if old_name not in categories:
+            raise HTTPException(status_code=404, detail="category_not_found")
+
+        moved = 0
+        for data in auth_db.values():
+            if clean_category(data.get("category")) == old_name:
+                data["category"] = new_name
+                moved += 1
+
+        # 기존 카테고리는 제거하고, 새 이름이 없을 때만 추가합니다.
+        categories[:] = [c for c in categories if c != old_name]
+        if new_name not in categories:
+            categories.append(new_name)
+
+        save_data()
+        save_categories()
+        return moved
+
+
+def delete_category_and_reassign(name: str) -> int:
+    """PC 웹 관리자 전용 카테고리 삭제.
+    카테고리 자체만 삭제하고 해당 인증키는 삭제하지 않으며 모두 '미지정'으로 이동합니다.
+    """
+    name = clean_category(name)
+    if name == "미지정":
+        raise HTTPException(status_code=400, detail="cannot_delete_unspecified")
+
+    with _db_lock:
+        if name not in categories:
+            raise HTTPException(status_code=404, detail="category_not_found")
+
+        moved = 0
+        for data in auth_db.values():
+            if clean_category(data.get("category")) == name:
+                data["category"] = "미지정"
+                moved += 1
+
+        categories[:] = [c for c in categories if c != name]
+        # 먼저 인증키 데이터를 저장하고, 이후 카테고리 목록을 저장합니다.
+        # 각 저장 함수는 기존 파일을 .bak로 남깁니다.
+        save_data()
+        save_categories()
+        return moved
+
+
+def build_full_backup_zip() -> bytes:
+    """인증키/비밀번호/토큰/상태/카테고리 등 운영 데이터를 ZIP 하나로 백업합니다."""
+    with _db_lock:
+        auth_snapshot = {code: dict(data) for code, data in auth_db.items()}
+        category_snapshot = list(categories)
+
+    manifest = {
+        "format": "codenote-auth-backup",
+        "version": 1,
+        "exportedAt": datetime.now().isoformat(timespec="seconds"),
+        "records": len(auth_snapshot),
+        "categories": len(category_snapshot),
+    }
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        zf.writestr("auth_data.json", json.dumps(auth_snapshot, ensure_ascii=False, indent=2))
+        zf.writestr("auth_categories.json", json.dumps(category_snapshot, ensure_ascii=False, indent=2))
+    return out.getvalue()
+
+
+def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
+    """백업 ZIP을 검증한 뒤 서버 운영 데이터를 해당 시점으로 전체 복원합니다."""
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty_backup")
+    if len(raw) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="backup_too_large")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+            names = set(zf.namelist())
+            required = {"manifest.json", "auth_data.json", "auth_categories.json"}
+            if not required.issubset(names):
+                raise ValueError("required_files_missing")
+
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            incoming_db = json.loads(zf.read("auth_data.json").decode("utf-8"))
+            incoming_categories = json.loads(zf.read("auth_categories.json").decode("utf-8"))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid_backup: {exc}") from exc
+
+    if not isinstance(manifest, dict) or manifest.get("format") != "codenote-auth-backup" or manifest.get("version") != 1:
+        raise HTTPException(status_code=400, detail="unsupported_backup")
+    if not isinstance(incoming_db, dict):
+        raise HTTPException(status_code=400, detail="invalid_auth_data")
+    if not isinstance(incoming_categories, list):
+        raise HTTPException(status_code=400, detail="invalid_categories")
+
+    normalized_db: dict[str, dict] = {}
+    for code, record in incoming_db.items():
+        if not isinstance(code, str) or not code.strip() or not isinstance(record, dict):
+            raise HTTPException(status_code=400, detail="invalid_record")
+        item = dict(record)
+        _normalize_record(item)
+        item["category"] = clean_category(item.get("category"))
+        normalized_db[code] = item
+
+    normalized_categories: list[str] = []
+    for value in incoming_categories:
+        name = clean_category(str(value))
+        if name != "미지정" and name not in normalized_categories:
+            normalized_categories.append(name)
+
+    # 백업 파일의 인증키 레코드에만 존재하는 카테고리도 유실하지 않습니다.
+    for item in normalized_db.values():
+        name = clean_category(item.get("category"))
+        if name != "미지정" and name not in normalized_categories:
+            normalized_categories.append(name)
+
+    with _db_lock:
+        auth_db.clear()
+        auth_db.update(normalized_db)
+        categories[:] = normalized_categories
+        # _atomic_json_save가 현재 서버 파일을 .bak로 남긴 뒤 교체합니다.
+        save_data()
+        save_categories()
+
+    return len(normalized_db), len(normalized_categories)
+
+
+
+def _normalize_restore_payload(incoming_db, incoming_categories=None) -> tuple[dict[str, dict], list[str]]:
+    """JSON/ZIP 공통 복원 검증. 기존 인증키의 모든 필드는 그대로 보존합니다."""
+    if not isinstance(incoming_db, dict):
+        raise HTTPException(status_code=400, detail="invalid_auth_data")
+
+    normalized_db: dict[str, dict] = {}
+    for code, record in incoming_db.items():
+        if not isinstance(code, str) or not code.strip() or not isinstance(record, dict):
+            raise HTTPException(status_code=400, detail="invalid_record")
+        item = dict(record)
+        _normalize_record(item)
+        item["category"] = clean_category(item.get("category"))
+        normalized_db[code] = item
+
+    normalized_categories: list[str] = []
+    if incoming_categories is not None:
+        if not isinstance(incoming_categories, list):
+            raise HTTPException(status_code=400, detail="invalid_categories")
+        for value in incoming_categories:
+            name = clean_category(str(value))
+            if name != "미지정" and name not in normalized_categories:
+                normalized_categories.append(name)
+
+    # 카테고리 배열이 없거나 누락된 카테고리가 있어도 인증키 데이터에서 자동 복원합니다.
+    for item in normalized_db.values():
+        name = clean_category(item.get("category"))
+        if name != "미지정" and name not in normalized_categories:
+            normalized_categories.append(name)
+
+    return normalized_db, normalized_categories
+
+
+def _replace_server_data(normalized_db: dict[str, dict], normalized_categories: list[str]) -> tuple[int, int]:
+    """현재 운영 데이터를 백업 내용으로 전체 복원합니다. 저장 시 기존 파일은 .bak로 남습니다."""
+    with _db_lock:
+        auth_db.clear()
+        auth_db.update(normalized_db)
+        categories[:] = normalized_categories
+        save_data()
+        save_categories()
+    return len(normalized_db), len(normalized_categories)
+
+
+def restore_full_backup_json(raw: bytes) -> tuple[int, int]:
+    """기존 PC JSON 백업 또는 raw auth_data.json을 전체 복원합니다."""
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty_backup")
+    if len(raw) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="backup_too_large")
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid_json_backup: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_json_backup")
+
+    # 현재 사용 중인 PC JSON 백업 형식:
+    # {"exportedAt":..., "auth_db": {...}, "categories": [...]}
+    if "auth_db" in payload:
+        incoming_db = payload.get("auth_db")
+        incoming_categories = payload.get("categories", [])
+    else:
+        # 과거 auth_data.json 자체를 백업한 파일도 복원 가능하게 유지합니다.
+        incoming_db = payload
+        incoming_categories = None
+
+    normalized_db, normalized_categories = _normalize_restore_payload(incoming_db, incoming_categories)
+    return _replace_server_data(normalized_db, normalized_categories)
+
+
+def restore_backup_auto(raw: bytes, filename: str = "", content_type: str = "") -> tuple[int, int, str]:
+    """파일 확장자/내용을 판별해 JSON 또는 ZIP 백업을 복원합니다."""
+    name = (filename or "").lower()
+    ctype = (content_type or "").lower()
+    is_zip = name.endswith(".zip") or "zip" in ctype or raw[:4] == b"PK\\x03\\x04"
+    if is_zip:
+        records, category_count = restore_full_backup_zip(raw)
+        return records, category_count, "zip"
+    records, category_count = restore_full_backup_json(raw)
+    return records, category_count, "json"
 
 
 def update_code(req: UpdateAuthRequest):
@@ -780,6 +1015,25 @@ async def web_add_category(req: CategoryRequest, request: Request):
     return {"status": "ok", "category": name}
 
 
+@app.post("/admin/api/categories/rename")
+async def web_rename_category(req: CategoryRenameRequest, request: Request):
+    require_web_login(request)
+    moved = rename_category_and_reassign(req.oldName, req.newName)
+    return {
+        "status": "ok",
+        "oldCategory": req.oldName.strip(),
+        "newCategory": clean_category(req.newName),
+        "moved": moved,
+    }
+
+
+@app.post("/admin/api/categories/delete")
+async def web_delete_category(req: CategoryRequest, request: Request):
+    require_web_login(request)
+    moved = delete_category_and_reassign(req.name)
+    return {"status": "ok", "deletedCategory": req.name.strip(), "movedToUnspecified": moved}
+
+
 @app.post("/admin/api/register")
 async def web_register(req: FullRegisterRequest, request: Request):
     require_web_login(request)
@@ -830,6 +1084,7 @@ async def web_delete(req: CodeRequest, request: Request):
 
 @app.get("/admin/api/export-json")
 async def web_export_json(request: Request):
+    # 기존 직접 호출 호환을 위해 경로는 유지하지만 PC UI에서는 ZIP 백업을 사용합니다.
     require_web_login(request)
     payload = {
         "exportedAt": datetime.now().isoformat(timespec="seconds"),
@@ -842,11 +1097,42 @@ async def web_export_json(request: Request):
     )
 
 
+@app.get("/admin/api/backup-zip")
+async def web_backup_zip(request: Request):
+    require_web_login(request)
+    raw = build_full_backup_zip()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return StreamingResponse(
+        io.BytesIO(raw),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="CodeNoteAuth_Backup_{stamp}.zip"'},
+    )
+
+
+@app.post("/admin/api/restore-backup")
+async def web_restore_backup(request: Request):
+    require_web_login(request)
+    raw = await request.body()
+    filename = request.headers.get("X-Backup-Filename", "")
+    content_type = request.headers.get("Content-Type", "")
+    records, category_count, backup_type = restore_backup_auto(raw, filename, content_type)
+    return {"status": "ok", "records": records, "categories": category_count, "type": backup_type}
+
+
+# 이전 ZIP 전용 경로도 호환을 위해 유지합니다.
+@app.post("/admin/api/restore-zip")
+async def web_restore_zip(request: Request):
+    require_web_login(request)
+    raw = await request.body()
+    records, category_count = restore_full_backup_zip(raw)
+    return {"status": "ok", "records": records, "categories": category_count, "type": "zip"}
+
+
 ADMIN_HTML = r'''<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Poket 인증 관리자</title>
+<title>코드노트 인증키</title>
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#171717;color:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 .wrap{max-width:1180px;margin:auto;padding:24px}.card{background:#242424;border:1px solid #494949;border-radius:18px;padding:20px;margin-bottom:16px}.row{display:flex;gap:10px;flex-wrap:wrap}.grow{flex:1;min-width:160px}
@@ -858,11 +1144,12 @@ label{display:block;font-size:13px;color:#aaa;margin:10px 0 5px}h1,h2,h3{margin-
 <body><div class="wrap">
 <div id="loginCard" class="card"><h2>🔐 관리자 로그인</h2><div class="row"><input id="loginCode" class="grow" type="password" placeholder="인증키"><button class="primary" onclick="login()">로그인</button></div><p id="loginMsg" class="deleted"></p></div>
 <div id="app" class="hidden">
-<div class="row" style="justify-content:space-between;align-items:center"><h1>Poket 인증 관리자</h1><div class="row"><button onclick="location.href='/admin/api/export-json'">JSON 백업</button><button onclick="logout()">로그아웃</button></div></div>
+<div class="row" style="justify-content:space-between;align-items:center"><h1>코드노트 인증키</h1><div class="row"><button onclick="location.href='/admin/api/backup-zip'">ZIP 백업</button><button onclick="document.getElementById('restoreBackup').click()">백업 복원</button><input id="restoreBackup" type="file" accept=".json,.zip,application/json,application/zip" class="hidden" onchange="restoreBackupFile(this)"><button onclick="logout()">로그아웃</button></div></div>
 <div class="card"><h2>인증키 등록</h2><div class="row"><input id="rName" class="grow" placeholder="성함"><input id="rPhone" class="grow" inputmode="numeric" maxlength="4" placeholder="전화번호 끝 4자리"></div><div class="row" style="margin-top:10px"><select id="rCategory" class="grow"></select><button onclick="addCategory()">+ 카테고리 추가</button></div><div class="row" style="margin-top:10px"><input id="rCode" class="grow" placeholder="인증키"><input id="rPwd" class="grow" placeholder="삭제 비밀번호"></div><div class="row" style="margin-top:10px"><button class="primary" onclick="registerCode()">서버 업로드</button><button onclick="clearRegister()">입력값 지우기</button></div></div>
-<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><button id="trashBtn" onclick="toggleTrash()">휴지통 보기</button></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
+<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button id="trashBtn" onclick="toggleTrash()">휴지통 보기</button><button onclick="openCategoryManager()">카테고리 관리</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
 </div></div>
 <div id="modal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between"><h2>인증키 상세</h2><button onclick="closeModal()">닫기</button></div><div id="detail"></div><div class="actions" id="detailActions"><button onclick="changeCategory()">카테고리</button><button onclick="activateSelected()">활성화</button><button onclick="deactivateSelected()">비활성화</button><button onclick="editSelected()">수정</button><button class="danger" onclick="deleteSelected()">삭제</button></div></div></div>
+<div id="categoryModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>카테고리 관리</h2><button onclick="closeCategoryManager()">닫기</button></div><div id="categoryManageList" class="list"></div><p class="muted" style="margin:14px 0 0">카테고리를 삭제하면 인증키는 삭제되지 않고 미지정으로 이동합니다.</p></div></div>
 <script>
 let items=[], categories=['미지정'], selectedCategory='전체', selected=null, showTrash=false;
 async function api(path,opt={}){let r=await fetch(path,{headers:{'Content-Type':'application/json',...(opt.headers||{})},...opt});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));return data}
@@ -880,6 +1167,13 @@ function renderList(){let a=filtered();list.innerHTML=a.length?a.map(x=>`<div cl
 function openItem(code){selected=items.find(x=>x.code===code);if(!selected)return;detail.innerHTML=`<label>성함</label><div>${esc(selected.name||'')}</div><label>전화번호</label><div>${esc(selected.phone||'')}</div><label>인증키</label><div class="code">${esc(selected.code)}</div><label>삭제 비밀번호</label><div>${esc(selected.delete_password||'')}</div><label>카테고리</label><div>${esc(selected.category||'미지정')}</div><label>등록일</label><div>${esc(selected.date||'')}</div><label>상태</label><div>${selected.deletedAt?'삭제됨':(selected.enabled?'활성':'비활성')}</div>`;modal.classList.remove('hidden')}
 function closeModal(){modal.classList.add('hidden');selected=null}
 async function addCategory(){let n=prompt('추가할 카테고리 이름');if(!n||!n.trim())return;await api('/admin/api/categories',{method:'POST',body:JSON.stringify({name:n.trim()})});await refresh();rCategory.value=n.trim()}
+function openCategoryManager(){renderCategoryManager();categoryModal.classList.remove('hidden')}
+function closeCategoryManager(){categoryModal.classList.add('hidden')}
+function categoryCount(name){return items.filter(x=>(x.category||'미지정')===name).length}
+function renderCategoryManager(){let names=['미지정',...categories.filter(c=>c!=='미지정')];categoryManageList.innerHTML=names.map(n=>{let isDefault=n==='미지정';return `<div class="item" style="cursor:default"><div class="row" style="justify-content:space-between;align-items:center"><div><b>${esc(n)}</b><div class="muted">인증키 ${categoryCount(n)}개</div></div><div class="row">${isDefault?'<span class="muted">기본 카테고리</span>':`<button onclick="renameCategory('${js(n)}')">수정</button><button class="danger" onclick="deleteCategory('${js(n)}')">삭제</button>`}</div></div></div>`}).join('')}
+async function renameCategory(oldName){let n=prompt('새 카테고리 이름',oldName);if(n===null)return;n=n.trim();if(!n||n===oldName)return;try{let r=await api('/admin/api/categories/rename',{method:'POST',body:JSON.stringify({oldName:oldName,newName:n})});if(selectedCategory===oldName)selectedCategory=n;await refresh();renderCategoryManager();alert('카테고리 수정 완료\n인증키 '+(r.moved||0)+'개가 '+n+' 카테고리로 이동했습니다.')}catch(e){alert('카테고리 수정 실패: '+e.message)}}
+async function deleteCategory(n){if(!n||n==='미지정')return;if(!confirm('카테고리 '+n+' 을(를) 삭제할까요?\n안에 있는 인증키는 삭제되지 않고 미지정으로 이동합니다.'))return;try{let r=await api('/admin/api/categories/delete',{method:'POST',body:JSON.stringify({name:n})});if(selectedCategory===n)selectedCategory='전체';await refresh();renderCategoryManager();alert('카테고리 삭제 완료\n인증키 '+(r.movedToUnspecified||0)+'개가 미지정으로 이동했습니다.')}catch(e){alert('카테고리 삭제 실패: '+e.message)}}
+async function restoreBackupFile(input){let f=input.files&&input.files[0];if(!f)return;try{if(!confirm('선택한 JSON 또는 ZIP 백업 시점의 인증키와 카테고리 전체 내용으로 복원할까요?\n현재 서버 내용은 백업 내용으로 교체됩니다.')){input.value='';return}let raw=await f.arrayBuffer();let r=await fetch('/admin/api/restore-backup',{method:'POST',headers:{'Content-Type':f.type||'application/octet-stream','X-Backup-Filename':f.name},body:raw});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));alert((data.type==='json'?'JSON':'ZIP')+' 복원 완료\n인증키 '+(data.records||0)+'개 / 카테고리 '+(data.categories||0)+'개');await refresh()}catch(e){alert('백업 복원 실패: '+e.message)}finally{input.value=''}}
 async function changeCategory(){if(!selected)return;let n=prompt('변경할 카테고리\n현재: '+(selected.category||'미지정')+'\n\n기존 카테고리: '+categories.join(', '),selected.category||'미지정');if(n===null)return;n=n.trim()||'미지정';if(n!=='미지정'&&!categories.includes(n))await api('/admin/api/categories',{method:'POST',body:JSON.stringify({name:n})});await api('/admin/api/category',{method:'POST',body:JSON.stringify({code:selected.code,category:n})});closeModal();await refresh()}
 async function activateSelected(){if(!selected)return;await api('/admin/api/activate',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
 async function deactivateSelected(){if(!selected)return;await api('/admin/api/deactivate',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
