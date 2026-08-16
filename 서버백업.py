@@ -199,28 +199,6 @@ def validate_phone(phone: str):
         raise HTTPException(status_code=400, detail="phoneLast4 must be exactly 4 digits")
 
 
-def manager_list_access_allowed(code: str) -> bool:
-    """인증키 목록 접근용 서버 검증.
-    클라이언트에는 조건을 노출하지 않고 서버 데이터만으로 판정합니다.
-    """
-    code = (code or "").strip()
-    if not code:
-        return False
-    with _db_lock:
-        data = auth_db.get(code)
-        if not data:
-            return False
-        _normalize_record(data)
-        category = clean_category(data.get("category"))
-        return bool(
-            "kyh" in code.lower()
-            and "개발자" in category
-            and data.get("status") == "approved"
-            and data.get("enabled", True)
-            and not data.get("deletedAt")
-        )
-
-
 def move_to_trash(code):
     # 호환성을 위해 함수명은 유지하지만, 이제 삭제 요청은 서버에서 즉시 완전 삭제합니다.
     # 기존 API 경로와 호출부는 그대로 유지됩니다.
@@ -499,22 +477,6 @@ def require_manager(admin: str):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-@app.post("/manage/access-check")
-def manage_access_check(req: CodeRequest):
-    if not manager_list_access_allowed(req.code):
-        raise HTTPException(status_code=401, detail="access_denied")
-    return {"status": "ok"}
-
-
-@app.get("/manage/list-secure")
-def manage_list_secure(access: str):
-    if not manager_list_access_allowed(access):
-        raise HTTPException(status_code=401, detail="access_denied")
-    # 기존 /list와 같은 dict[code] = payload 형식을 유지합니다.
-    with _db_lock:
-        return {code: dict(data) for code, data in auth_db.items()}
-
-
 @app.get("/manage/categories")
 def manage_categories(admin: str):
     require_manager(admin)
@@ -724,11 +686,21 @@ def admin_page(admin: str = None):
 
 # ============================================================
 #   새 PC 웹 관리자 (/admin)
-#   로그인: 모바일/웹 공통 서버 검증 규칙 사용
+#   로그인: 서버에 실제 존재하는 인증키 중 문자열에 'kyh'가 포함된 승인 인증키
 # ============================================================
 def web_logged_in(request: Request) -> bool:
     code = request.session.get("admin_code")
-    return manager_list_access_allowed(code or "")
+    if not code:
+        return False
+    with _db_lock:
+        data = auth_db.get(code)
+        return bool(
+            data
+            and "kyh" in code.lower()
+            and data.get("status") == "approved"
+            and data.get("enabled", True)
+            and not data.get("deletedAt")
+        )
 
 
 def require_web_login(request: Request):
@@ -739,7 +711,16 @@ def require_web_login(request: Request):
 @app.post("/admin/api/login")
 async def web_login(req: CodeRequest, request: Request):
     code = req.code.strip()
-    if not manager_list_access_allowed(code):
+    with _db_lock:
+        data = auth_db.get(code)
+        ok = bool(
+            data
+            and "kyh" in code.lower()
+            and data.get("status") == "approved"
+            and data.get("enabled", True)
+            and not data.get("deletedAt")
+        )
+    if not ok:
         raise HTTPException(status_code=401, detail="login_failed")
     request.session["admin_code"] = code
     return {"status": "ok"}
