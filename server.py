@@ -8,6 +8,7 @@ import threading
 import io
 import zipfile
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
@@ -22,6 +23,11 @@ DATA_FILE = os.environ.get("AUTH_DATA_FILE", "auth_data.json")
 CATEGORY_FILE = os.environ.get("AUTH_CATEGORY_FILE", "auth_categories.json")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Kim86110!@")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "poket-admin-session-v1-change-me")
+
+KST = ZoneInfo("Asia/Seoul")
+
+def now_kst():
+    return datetime.now(KST)
 
 app.add_middleware(
     SessionMiddleware,
@@ -240,7 +246,7 @@ def move_to_trash(code):
 
 
 def purge_trash():
-    now = datetime.now()
+    now = now_kst().replace(tzinfo=None)
     remove = []
     with _db_lock:
         for code, d in auth_db.items():
@@ -366,7 +372,7 @@ def build_full_backup_zip() -> bytes:
     manifest = {
         "format": "codenote-auth-backup",
         "version": 1,
-        "exportedAt": datetime.now().isoformat(timespec="seconds"),
+        "exportedAt": now_kst().isoformat(timespec="seconds"),
         "records": len(auth_snapshot),
         "categories": len(category_snapshot),
     }
@@ -590,7 +596,7 @@ def register(req: RegisterRequest):
     with _db_lock:
         if code not in auth_db:
             auth_db[code] = {
-                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "date": now_kst().strftime("%Y-%m-%d %H:%M"),
                 "name": req.name,
                 "phone": req.phoneLast4,
                 "status": "pending",
@@ -1087,7 +1093,7 @@ async def web_export_json(request: Request):
     # 기존 직접 호출 호환을 위해 경로는 유지하지만 PC UI에서는 ZIP 백업을 사용합니다.
     require_web_login(request)
     payload = {
-        "exportedAt": datetime.now().isoformat(timespec="seconds"),
+        "exportedAt": now_kst().isoformat(timespec="seconds"),
         "auth_db": auth_db,
         "categories": categories,
     }
@@ -1101,7 +1107,7 @@ async def web_export_json(request: Request):
 async def web_backup_zip(request: Request):
     require_web_login(request)
     raw = build_full_backup_zip()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = now_kst().strftime("%Y%m%d_%H%M%S")
     return StreamingResponse(
         io.BytesIO(raw),
         media_type="application/zip",
