@@ -41,6 +41,7 @@ app.add_middleware(
 ALWAYS_ACTIVE_KEYS = {
     "google-playstore-sign.key",
     "test.kyh",
+    "kyh",
 }
 
 _db_lock = threading.RLock()
