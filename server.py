@@ -446,12 +446,13 @@ def require_manage_token(request: Request, user_id: str):
         raise HTTPException(status_code=401, detail="manage_access_denied")
 
 
-def android_admin_profile_for_code(code: str) -> dict:
+def android_admin_profile_for_code(code: str, require_enabled: bool = True) -> dict:
     """Android 로그인 인증키의 현재 서버 상태로 업로드 권한을 결정합니다.
 
     - codenote.kyh / 초기 kyh: 전체 권한
     - 그 외 인증키: 그 인증키에 저장된 category만 업로드 가능
-    로그인 자체는 인증키를 소모/비활성화하지 않습니다.
+    - 최초 로그인 때만 활성 상태를 요구하고, 발급된 Android 세션은 로그인 직후
+      인증키가 비활성화되어도 계속 사용할 수 있습니다.
     """
     code = (code or "").strip()
     if not code:
@@ -461,7 +462,9 @@ def android_admin_profile_for_code(code: str) -> dict:
         if not data:
             raise HTTPException(status_code=401, detail="invalid_android_login_code")
         _normalize_record(data)
-        if data.get("deletedAt") or data.get("status") != "approved" or not data.get("enabled", True):
+        if data.get("deletedAt") or data.get("status") != "approved":
+            raise HTTPException(status_code=401, detail="invalid_android_login_code")
+        if require_enabled and not data.get("enabled", True):
             raise HTTPException(status_code=401, detail="invalid_android_login_code")
         allowed = "전체" if code in ANDROID_MASTER_KEYS else clean_category(data.get("category"))
         return {
@@ -486,8 +489,9 @@ def require_android_session_token(token: str) -> tuple[str, dict]:
     code = str(payload.get("code") or "").strip() if isinstance(payload, dict) else ""
     if not code:
         raise HTTPException(status_code=401, detail="invalid_android_session")
-    # 세션 발급 후에도 원본 인증키의 현재 활성/삭제/카테고리 상태를 다시 확인합니다.
-    return code, android_admin_profile_for_code(code)
+    # 로그인 성공 직후 일반 인증키는 비활성화되므로 세션 확인에서는 enabled를 다시 요구하지 않습니다.
+    # 단, 인증키 자체가 삭제되었거나 승인 상태가 아니게 된 경우에는 세션을 거부합니다.
+    return code, android_admin_profile_for_code(code, require_enabled=False)
 
 
 def require_android_session(request: Request) -> tuple[str, dict]:
@@ -1201,8 +1205,18 @@ def apple_admin_delete(req: AppleAdminDeleteRequest, request: Request):
 @app.post("/android-admin/login")
 def android_admin_login(req: CodeRequest):
     code = (req.code or "").strip()
-    profile = android_admin_profile_for_code(code)
-    return {"status": "ok", "sessionToken": issue_android_session(code), "profile": profile}
+    profile = android_admin_profile_for_code(code, require_enabled=True)
+    session_token = issue_android_session(code)
+
+    # 기존 /app/check 및 Apple 관리자 등록과 동일한 예외 규칙을 그대로 사용합니다.
+    # 일반 인증키는 Android 로그인 성공 즉시 비활성화하고,
+    # ALWAYS_ACTIVE_KEYS 및 #으로 시작하는 인증키는 기존처럼 활성 상태를 유지합니다.
+    if not _registration_code_uses_existing_exception_rule(code):
+        with _db_lock:
+            auth_db[code]["enabled"] = False
+            save_data()
+
+    return {"status": "ok", "sessionToken": session_token, "profile": profile}
 
 
 @app.get("/android-admin/session")
