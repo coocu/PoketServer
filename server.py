@@ -11,6 +11,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
+import jwt
+from jwt import PyJWKClient
+from itsdangerous import URLSafeSerializer, URLSafeTimedSerializer, BadSignature, SignatureExpired
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from openpyxl import Workbook
 from starlette.middleware.sessions import SessionMiddleware
@@ -23,6 +26,10 @@ DATA_FILE = os.environ.get("AUTH_DATA_FILE", "auth_data.json")
 CATEGORY_FILE = os.environ.get("AUTH_CATEGORY_FILE", "auth_categories.json")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Kim86110!@")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "poket-admin-session-v1-change-me")
+APPLE_ADMIN_FILE = os.environ.get("APPLE_ADMIN_FILE", "apple_admins.json")
+APPLE_CLIENT_ID = os.environ.get("APPLE_CLIENT_ID", "com.codenote.id")
+APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+DATA_FILE_EXISTED_AT_BOOT = os.path.exists(DATA_FILE)
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -133,8 +140,65 @@ def save_categories():
         _atomic_json_save(CATEGORY_FILE, categories)
 
 
+def _normalize_apple_admin(record: dict) -> dict:
+    record.setdefault("provider", "apple")
+    record.setdefault("label", "")
+    record.setdefault("registeredAt", now_kst().isoformat(timespec="seconds"))
+    record.setdefault("allowedCategory", None)
+    return record
+
+
+def load_apple_admins():
+    if not os.path.exists(APPLE_ADMIN_FILE):
+        return {}
+    try:
+        with open(APPLE_ADMIN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("apple_admins.json must be a JSON object")
+        normalized = {}
+        for key, value in data.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                raise ValueError("invalid apple admin record")
+            normalized[key] = _normalize_apple_admin(dict(value))
+        return normalized
+    except Exception as exc:
+        raise RuntimeError(f"Apple 관리자 데이터 로드 실패: {exc}") from exc
+
+
+def save_apple_admins():
+    with _db_lock:
+        _atomic_json_save(APPLE_ADMIN_FILE, apple_admins)
+
+
 auth_db = load_data()
 categories = load_categories()
+apple_admins = load_apple_admins()
+
+
+def ensure_bootstrap_developer_key():
+    # 운영 데이터 파일 자체가 없는 완전 초기 상태에서만 기본 관리자 인증키를 생성합니다.
+    if DATA_FILE_EXISTED_AT_BOOT:
+        return
+    with _db_lock:
+        if "개발자" not in categories:
+            categories.append("개발자")
+        auth_db["kyh"] = {
+            "date": now_kst().strftime("%Y-%m-%d %H:%M"),
+            "name": "개발자",
+            "phone": "0000",
+            "status": "approved",
+            "token": secrets.token_hex(32),
+            "delete_password": "del",
+            "deletedAt": None,
+            "category": "개발자",
+            "enabled": True,
+        }
+        save_categories()
+        save_data()
+
+
+ensure_bootstrap_developer_key()
 
 # 기존 API 호환용 상태값. 새 iOS 앱은 비밀번호 요청에 code도 같이 보내 레이스를 방지합니다.
 last_admin_code: str | None = None
@@ -200,6 +264,40 @@ class BackupImportRequest(BaseModel):
     replace: bool = False
 
 
+class AppleIdentityRequest(BaseModel):
+    identityToken: str
+    nonce: str
+
+
+class AppleAdminRegisterRequest(BaseModel):
+    identityToken: str
+    nonce: str
+    label: str
+    code: str
+
+
+class AppleAdminManageAccessRequest(BaseModel):
+    code: str
+
+
+class AppleAdminUpdateRequest(BaseModel):
+    userId: str
+    label: str
+    allowedCategory: Optional[str] = None
+
+
+class AppleAdminDeleteRequest(BaseModel):
+    userId: str
+
+
+class AppleAdminUploadRequest(BaseModel):
+    name: str
+    phoneLast4: str
+    code: str
+    deletePassword: str
+    category: str = "미지정"
+
+
 # ============================================================
 #   공통 유틸
 # ============================================================
@@ -233,6 +331,137 @@ def manager_list_access_allowed(code: str) -> bool:
             and data.get("enabled", True)
             and not data.get("deletedAt")
         )
+
+
+def _registration_code_uses_existing_exception_rule(code: str) -> bool:
+    # 기존 /app/check의 예외 규칙을 그대로 재사용합니다.
+    return code in ALWAYS_ACTIVE_KEYS or code.startswith("#")
+
+
+def validate_and_consume_kyh_code(code: str) -> dict:
+    code = (code or "").strip()
+    if not code or "kyh" not in code.lower():
+        raise HTTPException(status_code=401, detail="invalid_registration_code")
+    with _db_lock:
+        data = auth_db.get(code)
+        if not data:
+            raise HTTPException(status_code=401, detail="invalid_registration_code")
+        _normalize_record(data)
+        if data.get("deletedAt") or data.get("status") != "approved" or not data.get("enabled", True):
+            raise HTTPException(status_code=401, detail="invalid_registration_code")
+        if not _registration_code_uses_existing_exception_rule(code):
+            data["enabled"] = False
+            save_data()
+        return dict(data)
+
+
+_apple_jwk_client = PyJWKClient(APPLE_JWKS_URL)
+_apple_session_serializer = URLSafeSerializer(SESSION_SECRET, salt="codenote-apple-admin-session-v1")
+_apple_manage_serializer = URLSafeTimedSerializer(SESSION_SECRET, salt="codenote-apple-admin-manage-v1")
+
+
+def verify_apple_identity_token(identity_token: str, nonce: str) -> str:
+    token = (identity_token or "").strip()
+    expected_nonce = (nonce or "").strip()
+    if not token or not expected_nonce:
+        raise HTTPException(status_code=401, detail="invalid_apple_credential")
+    try:
+        signing_key = _apple_jwk_client.get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=APPLE_CLIENT_ID,
+            issuer="https://appleid.apple.com",
+            options={"require": ["exp", "iss", "aud", "sub"]},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="invalid_apple_credential") from exc
+    if claims.get("nonce") != expected_nonce:
+        raise HTTPException(status_code=401, detail="invalid_apple_nonce")
+    user_id = str(claims.get("sub") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="invalid_apple_user")
+    return user_id
+
+
+def issue_apple_session(user_id: str) -> str:
+    return _apple_session_serializer.dumps({"provider": "apple", "userId": user_id})
+
+
+def apple_admin_profile(user_id: str) -> dict:
+    record = apple_admins.get(user_id)
+    if not record:
+        raise HTTPException(status_code=401, detail="apple_admin_not_registered")
+    record = _normalize_apple_admin(record)
+    return {
+        "userId": user_id,
+        "provider": "apple",
+        "label": record.get("label", ""),
+        "registeredAt": record.get("registeredAt", ""),
+        "allowedCategory": record.get("allowedCategory"),
+    }
+
+
+def require_apple_session_token(token: str) -> tuple[str, dict]:
+    token = (token or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="apple_login_required")
+    try:
+        payload = _apple_session_serializer.loads(token)
+    except BadSignature as exc:
+        raise HTTPException(status_code=401, detail="invalid_apple_session") from exc
+    user_id = str(payload.get("userId") or "").strip() if isinstance(payload, dict) else ""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="invalid_apple_session")
+    with _db_lock:
+        if user_id not in apple_admins:
+            raise HTTPException(status_code=401, detail="apple_admin_removed")
+        return user_id, apple_admin_profile(user_id)
+
+
+def require_apple_session(request: Request) -> tuple[str, dict]:
+    return require_apple_session_token(request.headers.get("X-Apple-Session", ""))
+
+
+def issue_manage_token(user_id: str) -> str:
+    return _apple_manage_serializer.dumps({"userId": user_id})
+
+
+def require_manage_token(request: Request, user_id: str):
+    token = request.headers.get("X-Manage-Token", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="manage_access_required")
+    try:
+        payload = _apple_manage_serializer.loads(token, max_age=60 * 15)
+    except (BadSignature, SignatureExpired) as exc:
+        raise HTTPException(status_code=401, detail="manage_access_expired") from exc
+    if not isinstance(payload, dict) or payload.get("userId") != user_id:
+        raise HTTPException(status_code=401, detail="manage_access_denied")
+
+
+def validate_upload_category(profile: dict, requested: str) -> str:
+    allowed = profile.get("allowedCategory")
+    if allowed is None or str(allowed).strip() == "":
+        raise HTTPException(status_code=403, detail="upload_category_not_assigned")
+    requested = clean_category(requested)
+    if allowed == "전체":
+        return requested
+    if requested != allowed:
+        raise HTTPException(status_code=403, detail="category_not_allowed")
+    return str(allowed)
+
+
+@app.middleware("http")
+async def enforce_registered_apple_admin_for_iphone_requests(request: Request, call_next):
+    # 기존 앱은 이 헤더를 보내지 않으므로 기존 API 동작은 그대로 유지됩니다.
+    token = request.headers.get("X-Apple-Session", "")
+    if token:
+        try:
+            require_apple_session_token(token)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
 
 
 def move_to_trash(code):
@@ -333,8 +562,12 @@ def rename_category_and_reassign(old_name: str, new_name: str) -> int:
         if new_name not in categories:
             categories.append(new_name)
 
+        for admin_record in apple_admins.values():
+            if admin_record.get("allowedCategory") == old_name:
+                admin_record["allowedCategory"] = new_name
         save_data()
         save_categories()
+        save_apple_admins()
         return moved
 
 
@@ -359,8 +592,12 @@ def delete_category_and_reassign(name: str) -> int:
         categories[:] = [c for c in categories if c != name]
         # 먼저 인증키 데이터를 저장하고, 이후 카테고리 목록을 저장합니다.
         # 각 저장 함수는 기존 파일을 .bak로 남깁니다.
+        for admin_record in apple_admins.values():
+            if admin_record.get("allowedCategory") == name:
+                admin_record["allowedCategory"] = None
         save_data()
         save_categories()
+        save_apple_admins()
         return moved
 
 
@@ -369,6 +606,7 @@ def build_full_backup_zip() -> bytes:
     with _db_lock:
         auth_snapshot = {code: dict(data) for code, data in auth_db.items()}
         category_snapshot = list(categories)
+        apple_admin_snapshot = {user_id: dict(data) for user_id, data in apple_admins.items()}
 
     manifest = {
         "format": "codenote-auth-backup",
@@ -376,6 +614,7 @@ def build_full_backup_zip() -> bytes:
         "exportedAt": now_kst().isoformat(timespec="seconds"),
         "records": len(auth_snapshot),
         "categories": len(category_snapshot),
+        "appleAdmins": len(apple_admin_snapshot),
     }
 
     out = io.BytesIO()
@@ -383,6 +622,7 @@ def build_full_backup_zip() -> bytes:
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         zf.writestr("auth_data.json", json.dumps(auth_snapshot, ensure_ascii=False, indent=2))
         zf.writestr("auth_categories.json", json.dumps(category_snapshot, ensure_ascii=False, indent=2))
+        zf.writestr("apple_admins.json", json.dumps(apple_admin_snapshot, ensure_ascii=False, indent=2))
     return out.getvalue()
 
 
@@ -403,6 +643,7 @@ def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
             manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
             incoming_db = json.loads(zf.read("auth_data.json").decode("utf-8"))
             incoming_categories = json.loads(zf.read("auth_categories.json").decode("utf-8"))
+            incoming_apple_admins = json.loads(zf.read("apple_admins.json").decode("utf-8")) if "apple_admins.json" in names else None
     except HTTPException:
         raise
     except Exception as exc:
@@ -436,13 +677,28 @@ def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
         if name != "미지정" and name not in normalized_categories:
             normalized_categories.append(name)
 
+    normalized_apple_admins = None
+    if incoming_apple_admins is not None:
+        if not isinstance(incoming_apple_admins, dict):
+            raise HTTPException(status_code=400, detail="invalid_apple_admins")
+        normalized_apple_admins = {}
+        for user_id, record in incoming_apple_admins.items():
+            if not isinstance(user_id, str) or not user_id.strip() or not isinstance(record, dict):
+                raise HTTPException(status_code=400, detail="invalid_apple_admin_record")
+            normalized_apple_admins[user_id] = _normalize_apple_admin(dict(record))
+
     with _db_lock:
         auth_db.clear()
         auth_db.update(normalized_db)
         categories[:] = normalized_categories
+        if normalized_apple_admins is not None:
+            apple_admins.clear()
+            apple_admins.update(normalized_apple_admins)
         # _atomic_json_save가 현재 서버 파일을 .bak로 남긴 뒤 교체합니다.
         save_data()
         save_categories()
+        if normalized_apple_admins is not None:
+            save_apple_admins()
 
     return len(normalized_db), len(normalized_categories)
 
@@ -731,6 +987,138 @@ def app_delete_password(code: Optional[str] = None):
         if target and target in auth_db:
             return {"password": auth_db[target].get("delete_password")}
     return {"password": None}
+
+
+# ============================================================
+#   Apple 로그인 / Apple 관리자 권한 API (기존 API와 분리)
+# ============================================================
+@app.post("/apple-admin/login")
+def apple_admin_login(req: AppleIdentityRequest):
+    user_id = verify_apple_identity_token(req.identityToken, req.nonce)
+    with _db_lock:
+        if user_id not in apple_admins:
+            return {"registered": False}
+        profile = apple_admin_profile(user_id)
+    return {"registered": True, "sessionToken": issue_apple_session(user_id), "profile": profile}
+
+
+@app.post("/apple-admin/register")
+def apple_admin_register(req: AppleAdminRegisterRequest):
+    user_id = verify_apple_identity_token(req.identityToken, req.nonce)
+    label = (req.label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label_required")
+    validate_and_consume_kyh_code(req.code)
+    with _db_lock:
+        if user_id not in apple_admins:
+            apple_admins[user_id] = {
+                "provider": "apple",
+                "label": label,
+                "registeredAt": now_kst().isoformat(timespec="seconds"),
+                "allowedCategory": None,
+            }
+        else:
+            apple_admins[user_id]["label"] = label
+        save_apple_admins()
+        profile = apple_admin_profile(user_id)
+    return {"status": "ok", "sessionToken": issue_apple_session(user_id), "profile": profile}
+
+
+@app.get("/apple-admin/session")
+def apple_admin_session(request: Request):
+    _, profile = require_apple_session(request)
+    return {"status": "ok", "profile": profile}
+
+
+@app.get("/apple-admin/upload-categories")
+def apple_admin_upload_categories(request: Request):
+    _, profile = require_apple_session(request)
+    allowed = profile.get("allowedCategory")
+    if allowed is None or str(allowed).strip() == "":
+        return {"categories": [], "allowedCategory": None, "canAddCategory": False}
+    if allowed == "전체":
+        return {"categories": ["미지정"] + sorted(categories, key=lambda x: x.lower()), "allowedCategory": "전체", "canAddCategory": True}
+    return {"categories": [str(allowed)], "allowedCategory": str(allowed), "canAddCategory": False}
+
+
+@app.post("/apple-admin/upload-categories")
+def apple_admin_add_upload_category(req: CategoryRequest, request: Request):
+    _, profile = require_apple_session(request)
+    if profile.get("allowedCategory") != "전체":
+        raise HTTPException(status_code=403, detail="category_add_not_allowed")
+    name = clean_category(req.name)
+    if name != "미지정":
+        with _db_lock:
+            if name not in categories:
+                categories.append(name)
+                save_categories()
+    return {"status": "ok", "category": name}
+
+
+@app.post("/apple-admin/upload")
+def apple_admin_upload(req: AppleAdminUploadRequest, request: Request):
+    _, profile = require_apple_session(request)
+    validate_phone(req.phoneLast4)
+    category = validate_upload_category(profile, req.category)
+    # 기존 서버 등록 순서를 그대로 실행합니다.
+    register(RegisterRequest(name=req.name, phoneLast4=req.phoneLast4, code=req.code))
+    approve(CodeRequest(code=req.code))
+    set_delete_pwd(PasswordRequest(password=req.deletePassword, code=req.code))
+    set_category_for_code(req.code, category)
+    return {"status": "ok", "code": req.code, "category": category}
+
+
+@app.post("/apple-admin/manage-access")
+def apple_admin_manage_access(req: AppleAdminManageAccessRequest, request: Request):
+    user_id, _ = require_apple_session(request)
+    validate_and_consume_kyh_code(req.code)
+    return {"status": "ok", "manageToken": issue_manage_token(user_id)}
+
+
+@app.get("/apple-admin/admins")
+def apple_admin_list(request: Request):
+    user_id, _ = require_apple_session(request)
+    require_manage_token(request, user_id)
+    with _db_lock:
+        items = [apple_admin_profile(uid) for uid in apple_admins.keys()]
+    items.sort(key=lambda x: x.get("registeredAt") or "", reverse=True)
+    return {"items": items}
+
+
+@app.post("/apple-admin/admins/update")
+def apple_admin_update(req: AppleAdminUpdateRequest, request: Request):
+    user_id, _ = require_apple_session(request)
+    require_manage_token(request, user_id)
+    label = (req.label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label_required")
+    allowed = req.allowedCategory
+    if allowed is not None:
+        allowed = str(allowed).strip()
+        if not allowed:
+            allowed = None
+    if allowed not in (None, "전체", "미지정") and allowed not in categories:
+        raise HTTPException(status_code=400, detail="category_not_found")
+    with _db_lock:
+        if req.userId not in apple_admins:
+            raise HTTPException(status_code=404, detail="apple_admin_not_found")
+        apple_admins[req.userId]["label"] = label
+        apple_admins[req.userId]["allowedCategory"] = allowed
+        save_apple_admins()
+        profile = apple_admin_profile(req.userId)
+    return {"status": "ok", "profile": profile}
+
+
+@app.post("/apple-admin/admins/delete")
+def apple_admin_delete(req: AppleAdminDeleteRequest, request: Request):
+    user_id, _ = require_apple_session(request)
+    require_manage_token(request, user_id)
+    with _db_lock:
+        if req.userId not in apple_admins:
+            raise HTTPException(status_code=404, detail="apple_admin_not_found")
+        del apple_admins[req.userId]
+        save_apple_admins()
+    return {"status": "ok", "deletedSelf": req.userId == user_id}
 
 
 # ============================================================
@@ -1089,6 +1477,46 @@ async def web_delete(req: CodeRequest, request: Request):
     return {"status": "moved_to_trash"}
 
 
+@app.get("/admin/api/apple-admins")
+async def web_apple_admins(request: Request):
+    require_web_login(request)
+    with _db_lock:
+        items = [apple_admin_profile(uid) for uid in apple_admins.keys()]
+    items.sort(key=lambda x: x.get("registeredAt") or "", reverse=True)
+    return {"items": items}
+
+
+@app.post("/admin/api/apple-admins/update")
+async def web_apple_admin_update(req: AppleAdminUpdateRequest, request: Request):
+    require_web_login(request)
+    label = (req.label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label_required")
+    allowed = req.allowedCategory
+    if allowed is not None:
+        allowed = str(allowed).strip() or None
+    if allowed not in (None, "전체", "미지정") and allowed not in categories:
+        raise HTTPException(status_code=400, detail="category_not_found")
+    with _db_lock:
+        if req.userId not in apple_admins:
+            raise HTTPException(status_code=404, detail="apple_admin_not_found")
+        apple_admins[req.userId]["label"] = label
+        apple_admins[req.userId]["allowedCategory"] = allowed
+        save_apple_admins()
+    return {"status": "ok"}
+
+
+@app.post("/admin/api/apple-admins/delete")
+async def web_apple_admin_delete(req: AppleAdminDeleteRequest, request: Request):
+    require_web_login(request)
+    with _db_lock:
+        if req.userId not in apple_admins:
+            raise HTTPException(status_code=404, detail="apple_admin_not_found")
+        del apple_admins[req.userId]
+        save_apple_admins()
+    return {"status": "ok"}
+
+
 @app.get("/admin/api/export-json")
 async def web_export_json(request: Request):
     # 기존 직접 호출 호환을 위해 경로는 유지하지만 PC UI에서는 ZIP 백업을 사용합니다.
@@ -1097,6 +1525,7 @@ async def web_export_json(request: Request):
         "exportedAt": now_kst().isoformat(timespec="seconds"),
         "auth_db": auth_db,
         "categories": categories,
+        "apple_admins": apple_admins,
     }
     return JSONResponse(
         payload,
@@ -1151,12 +1580,14 @@ label{display:block;font-size:13px;color:#aaa;margin:10px 0 5px}h1,h2,h3{margin-
 <body><div class="wrap">
 <div id="loginCard" class="card"><h2>🔐 관리자 로그인</h2><div class="row"><input id="loginCode" class="grow" type="password" placeholder="인증키"><button class="primary" onclick="login()">로그인</button></div><p id="loginMsg" class="deleted"></p></div>
 <div id="app" class="hidden">
-<div class="row" style="justify-content:space-between;align-items:center"><h1>코드노트 인증키</h1><div class="row"><button onclick="location.href='/admin/api/backup-zip'">ZIP 백업</button><button onclick="document.getElementById('restoreBackup').click()">백업 복원</button><input id="restoreBackup" type="file" accept=".json,.zip,application/json,application/zip" class="hidden" onchange="restoreBackupFile(this)"><button onclick="logout()">로그아웃</button></div></div>
+<div class="row" style="justify-content:space-between;align-items:center"><h1>코드노트 인증키</h1><div class="row"><button onclick="openBackupModal()">백업 / 복원</button><input id="restoreBackup" type="file" accept=".zip,application/zip" class="hidden" onchange="restoreBackupFile(this)"><button onclick="logout()">로그아웃</button></div></div>
 <div class="card"><h2>인증키 등록</h2><div class="row"><input id="rName" class="grow" placeholder="성함"><input id="rPhone" class="grow" inputmode="numeric" maxlength="4" placeholder="전화번호 끝 4자리"></div><div class="row" style="margin-top:10px"><select id="rCategory" class="grow"></select><button onclick="addCategory()">+ 카테고리 추가</button></div><div class="row" style="margin-top:10px"><input id="rCode" class="grow" placeholder="인증키"><input id="rPwd" class="grow" placeholder="삭제 비밀번호"></div><div class="row" style="margin-top:10px"><button class="primary" onclick="registerCode()">서버 업로드</button><button onclick="clearRegister()">입력값 지우기</button></div></div>
-<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button id="trashBtn" onclick="toggleTrash()">휴지통 보기</button><button onclick="openCategoryManager()">카테고리 관리</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
+<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button id="trashBtn" onclick="toggleTrash()">휴지통 보기</button><button onclick="openCategoryManager()">카테고리 관리</button><button onclick="openAppleAdminManager()">인증 등록 내역</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
 </div></div>
 <div id="modal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between"><h2>인증키 상세</h2><button onclick="closeModal()">닫기</button></div><div id="detail"></div><div class="actions" id="detailActions"><button onclick="changeCategory()">카테고리</button><button onclick="activateSelected()">활성화</button><button onclick="deactivateSelected()">비활성화</button><button onclick="editSelected()">수정</button><button class="danger" onclick="deleteSelected()">삭제</button></div></div></div>
 <div id="categoryModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>카테고리 관리</h2><button onclick="closeCategoryManager()">닫기</button></div><div id="categoryManageList" class="list"></div><p class="muted" style="margin:14px 0 0">카테고리를 삭제하면 인증키는 삭제되지 않고 미지정으로 이동합니다.</p></div></div>
+<div id="backupModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>백업 / 복원</h2><button onclick="closeBackupModal()">닫기</button></div><div class="row"><button class="primary grow" onclick="location.href='/admin/api/backup-zip'">ZIP 백업</button><button class="grow" onclick="document.getElementById('restoreBackup').click()">ZIP 복원</button></div></div></div>
+<div id="appleAdminModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증 등록 내역</h2><button onclick="closeAppleAdminManager()">닫기</button></div><div id="appleAdminList" class="list"></div></div></div>
 <script>
 let items=[], categories=['미지정'], selectedCategory='전체', selected=null, showTrash=false;
 async function api(path,opt={}){let r=await fetch(path,{headers:{'Content-Type':'application/json',...(opt.headers||{})},...opt});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));return data}
@@ -1180,7 +1611,7 @@ function categoryCount(name){return items.filter(x=>(x.category||'미지정')===
 function renderCategoryManager(){let names=['미지정',...categories.filter(c=>c!=='미지정')];categoryManageList.innerHTML=names.map(n=>{let isDefault=n==='미지정';return `<div class="item" style="cursor:default"><div class="row" style="justify-content:space-between;align-items:center"><div><b>${esc(n)}</b><div class="muted">인증키 ${categoryCount(n)}개</div></div><div class="row">${isDefault?'<span class="muted">기본 카테고리</span>':`<button onclick="renameCategory('${js(n)}')">수정</button><button class="danger" onclick="deleteCategory('${js(n)}')">삭제</button>`}</div></div></div>`}).join('')}
 async function renameCategory(oldName){let n=prompt('새 카테고리 이름',oldName);if(n===null)return;n=n.trim();if(!n||n===oldName)return;try{let r=await api('/admin/api/categories/rename',{method:'POST',body:JSON.stringify({oldName:oldName,newName:n})});if(selectedCategory===oldName)selectedCategory=n;await refresh();renderCategoryManager();alert('카테고리 수정 완료\n인증키 '+(r.moved||0)+'개가 '+n+' 카테고리로 이동했습니다.')}catch(e){alert('카테고리 수정 실패: '+e.message)}}
 async function deleteCategory(n){if(!n||n==='미지정')return;if(!confirm('카테고리 '+n+' 을(를) 삭제할까요?\n안에 있는 인증키는 삭제되지 않고 미지정으로 이동합니다.'))return;try{let r=await api('/admin/api/categories/delete',{method:'POST',body:JSON.stringify({name:n})});if(selectedCategory===n)selectedCategory='전체';await refresh();renderCategoryManager();alert('카테고리 삭제 완료\n인증키 '+(r.movedToUnspecified||0)+'개가 미지정으로 이동했습니다.')}catch(e){alert('카테고리 삭제 실패: '+e.message)}}
-async function restoreBackupFile(input){let f=input.files&&input.files[0];if(!f)return;try{if(!confirm('선택한 JSON 또는 ZIP 백업 시점의 인증키와 카테고리 전체 내용으로 복원할까요?\n현재 서버 내용은 백업 내용으로 교체됩니다.')){input.value='';return}let raw=await f.arrayBuffer();let r=await fetch('/admin/api/restore-backup',{method:'POST',headers:{'Content-Type':f.type||'application/octet-stream','X-Backup-Filename':f.name},body:raw});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));alert((data.type==='json'?'JSON':'ZIP')+' 복원 완료\n인증키 '+(data.records||0)+'개 / 카테고리 '+(data.categories||0)+'개');await refresh()}catch(e){alert('백업 복원 실패: '+e.message)}finally{input.value=''}}
+async function restoreBackupFile(input){let f=input.files&&input.files[0];if(!f)return;try{if(!confirm('선택한 ZIP 백업 시점의 전체 서버 내용으로 복원할까요?\n현재 서버 내용은 백업 내용으로 교체됩니다.')){input.value='';return}let raw=await f.arrayBuffer();let r=await fetch('/admin/api/restore-backup',{method:'POST',headers:{'Content-Type':f.type||'application/octet-stream','X-Backup-Filename':f.name},body:raw});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));alert((data.type==='json'?'JSON':'ZIP')+' 복원 완료\n인증키 '+(data.records||0)+'개 / 카테고리 '+(data.categories||0)+'개');await refresh()}catch(e){alert('백업 복원 실패: '+e.message)}finally{input.value=''}}
 async function changeCategory(){if(!selected)return;let n=prompt('변경할 카테고리\n현재: '+(selected.category||'미지정')+'\n\n기존 카테고리: '+categories.join(', '),selected.category||'미지정');if(n===null)return;n=n.trim()||'미지정';if(n!=='미지정'&&!categories.includes(n))await api('/admin/api/categories',{method:'POST',body:JSON.stringify({name:n})});await api('/admin/api/category',{method:'POST',body:JSON.stringify({code:selected.code,category:n})});closeModal();await refresh()}
 async function activateSelected(){if(!selected)return;await api('/admin/api/activate',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
 async function deactivateSelected(){if(!selected)return;await api('/admin/api/deactivate',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
@@ -1190,6 +1621,13 @@ async function registerCode(){let o={name:rName.value.trim(),phoneLast4:rPhone.v
 function clearRegister(){rName.value='';rPhone.value='';rCode.value='';rPwd.value='';rCategory.value='미지정'}
 function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function js(v){return String(v??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'")}
+function openBackupModal(){backupModal.classList.remove('hidden')}
+function closeBackupModal(){backupModal.classList.add('hidden')}
+async function openAppleAdminManager(){try{let r=await api('/admin/api/apple-admins');renderAppleAdminManager(r.items||[]);appleAdminModal.classList.remove('hidden')}catch(e){alert('인증 등록 내역 불러오기 실패: '+e.message)}}
+function closeAppleAdminManager(){appleAdminModal.classList.add('hidden')}
+function renderAppleAdminManager(a){appleAdminList.innerHTML=a.length?a.map(x=>`<div class="item" style="cursor:default"><div class="itemtop"><b>${esc(x.label||'')}</b><span class="badge">${esc(x.allowedCategory||'권한 미설정')}</span></div><div class="muted">${esc(x.registeredAt||'')}</div><div class="code">${esc(x.userId||'')}</div><div class="row" style="margin-top:10px"><button onclick="editAppleAdmin('${js(x.userId)}','${js(x.label||'')}','${js(x.allowedCategory||'') }')">수정</button><button class="danger" onclick="deleteAppleAdmin('${js(x.userId)}')">삭제</button></div></div>`).join(''):'<p class="muted">등록된 Apple 관리자가 없습니다.</p>'}
+async function editAppleAdmin(userId,label,currentCategory){let newLabel=prompt('등록 문구',label);if(newLabel===null)return;newLabel=newLabel.trim();if(!newLabel)return alert('등록 문구를 입력하세요.');let guide='허용 카테고리 입력\n전체 또는 카테고리 이름\n비워두면 권한 미설정\n\n현재 카테고리: '+categories.join(', ');let allowed=prompt(guide,currentCategory||'');if(allowed===null)return;allowed=allowed.trim();let payload={userId:userId,label:newLabel,allowedCategory:allowed||null};try{await api('/admin/api/apple-admins/update',{method:'POST',body:JSON.stringify(payload)});await openAppleAdminManager();alert('수정 완료')}catch(e){alert('수정 실패: '+e.message)}}
+async function deleteAppleAdmin(userId){if(!confirm('이 관리자 등록을 삭제할까요?\n해당 계정은 다음 요청부터 앱을 사용할 수 없습니다.'))return;try{await api('/admin/api/apple-admins/delete',{method:'POST',body:JSON.stringify({userId:userId})});await openAppleAdminManager();alert('삭제 완료')}catch(e){alert('삭제 실패: '+e.message)}}
 boot();
 </script></body></html>'''
 
