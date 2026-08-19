@@ -635,15 +635,19 @@ def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
 
     try:
         with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
-            names = set(zf.namelist())
+            # 외부 ZIP 파일명은 사용하지 않고 압축 내부 JSON을 기준으로 복원합니다.
+            members = {Path(name).name.lower(): name for name in zf.namelist() if not name.endswith("/")}
             required = {"manifest.json", "auth_data.json", "auth_categories.json"}
-            if not required.issubset(names):
-                raise ValueError("required_files_missing")
+            if not required.issubset(members):
+                raise ValueError("required_json_files_missing")
 
-            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
-            incoming_db = json.loads(zf.read("auth_data.json").decode("utf-8"))
-            incoming_categories = json.loads(zf.read("auth_categories.json").decode("utf-8"))
-            incoming_apple_admins = json.loads(zf.read("apple_admins.json").decode("utf-8")) if "apple_admins.json" in names else None
+            manifest = json.loads(zf.read(members["manifest.json"]).decode("utf-8-sig"))
+            incoming_db = json.loads(zf.read(members["auth_data.json"]).decode("utf-8-sig"))
+            incoming_categories = json.loads(zf.read(members["auth_categories.json"]).decode("utf-8-sig"))
+            incoming_apple_admins = (
+                json.loads(zf.read(members["apple_admins.json"]).decode("utf-8-sig"))
+                if "apple_admins.json" in members else None
+            )
     except HTTPException:
         raise
     except Exception as exc:
@@ -777,9 +781,8 @@ def restore_full_backup_json(raw: bytes) -> tuple[int, int]:
 
 def restore_backup_auto(raw: bytes, filename: str = "", content_type: str = "") -> tuple[int, int, str]:
     """파일 확장자/내용을 판별해 JSON 또는 ZIP 백업을 복원합니다."""
-    name = (filename or "").lower()
-    ctype = (content_type or "").lower()
-    is_zip = name.endswith(".zip") or "zip" in ctype or raw[:4] == b"PK\\x03\\x04"
+    # 파일명/확장자와 무관하게 실제 ZIP 시그니처로 판별합니다.
+    is_zip = raw[:4] == b"PK\x03\x04"
     if is_zip:
         records, category_count = restore_full_backup_zip(raw)
         return records, category_count, "zip"
@@ -1580,16 +1583,17 @@ label{display:block;font-size:13px;color:#aaa;margin:10px 0 5px}h1,h2,h3{margin-
 <body><div class="wrap">
 <div id="loginCard" class="card"><h2>🔐 관리자 로그인</h2><div class="row"><input id="loginCode" class="grow" type="password" placeholder="인증키"><button class="primary" onclick="login()">로그인</button></div><p id="loginMsg" class="deleted"></p></div>
 <div id="app" class="hidden">
-<div class="row" style="justify-content:space-between;align-items:center"><h1>코드노트 인증키</h1><div class="row"><button onclick="openBackupModal()">백업 / 복원</button><input id="restoreBackup" type="file" accept=".zip,application/zip" class="hidden" onchange="restoreBackupFile(this)"><button onclick="logout()">로그아웃</button></div></div>
+<div class="row" style="justify-content:space-between;align-items:center"><h1>코드노트 인증키</h1><div class="row"><button onclick="openBackupModal()">백업 / 복원</button><input id="restoreBackup" type="file" class="hidden" onchange="restoreBackupFile(this)"><button onclick="logout()">로그아웃</button></div></div>
 <div class="card"><h2>인증키 등록</h2><div class="row"><input id="rName" class="grow" placeholder="성함"><input id="rPhone" class="grow" inputmode="numeric" maxlength="4" placeholder="전화번호 끝 4자리"></div><div class="row" style="margin-top:10px"><select id="rCategory" class="grow"></select><button onclick="addCategory()">+ 카테고리 추가</button></div><div class="row" style="margin-top:10px"><input id="rCode" class="grow" placeholder="인증키"><input id="rPwd" class="grow" placeholder="삭제 비밀번호"></div><div class="row" style="margin-top:10px"><button class="primary" onclick="registerCode()">서버 업로드</button><button onclick="clearRegister()">입력값 지우기</button></div></div>
-<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button id="trashBtn" onclick="toggleTrash()">휴지통 보기</button><button onclick="openCategoryManager()">카테고리 관리</button><button onclick="openAppleAdminManager()">인증 등록 내역</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
+<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button onclick="openCategoryManager()">카테고리 관리</button><button onclick="openAppleAdminManager()">인증 등록 내역</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
 </div></div>
 <div id="modal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between"><h2>인증키 상세</h2><button onclick="closeModal()">닫기</button></div><div id="detail"></div><div class="actions" id="detailActions"><button onclick="changeCategory()">카테고리</button><button onclick="activateSelected()">활성화</button><button onclick="deactivateSelected()">비활성화</button><button onclick="editSelected()">수정</button><button class="danger" onclick="deleteSelected()">삭제</button></div></div></div>
+<div id="editAuthModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 수정</h2><button onclick="closeEditAuthModal()">닫기</button></div><label>성함</label><input id="eName" style="width:100%"><label>전화번호 끝 4자리</label><input id="ePhone" style="width:100%" inputmode="numeric" maxlength="4"><label>인증키</label><input id="eCode" style="width:100%"><label>삭제 비밀번호</label><input id="ePwd" style="width:100%"><label>카테고리</label><select id="eCategory" style="width:100%"></select><div class="row" style="margin-top:16px"><button class="primary grow" onclick="saveEditSelected()">저장</button><button class="grow" onclick="closeEditAuthModal()">취소</button></div></div></div>
 <div id="categoryModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>카테고리 관리</h2><button onclick="closeCategoryManager()">닫기</button></div><div id="categoryManageList" class="list"></div><p class="muted" style="margin:14px 0 0">카테고리를 삭제하면 인증키는 삭제되지 않고 미지정으로 이동합니다.</p></div></div>
 <div id="backupModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>백업 / 복원</h2><button onclick="closeBackupModal()">닫기</button></div><div class="row"><button class="primary grow" onclick="location.href='/admin/api/backup-zip'">ZIP 백업</button><button class="grow" onclick="document.getElementById('restoreBackup').click()">ZIP 복원</button></div></div></div>
 <div id="appleAdminModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증 등록 내역</h2><button onclick="closeAppleAdminManager()">닫기</button></div><div id="appleAdminList" class="list"></div></div></div>
 <script>
-let items=[], categories=['미지정'], selectedCategory='전체', selected=null, showTrash=false;
+let items=[], categories=['미지정'], selectedCategory='전체', selected=null;
 async function api(path,opt={}){let r=await fetch(path,{headers:{'Content-Type':'application/json',...(opt.headers||{})},...opt});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));return data}
 async function boot(){try{let s=await api('/admin/api/session');if(s.loggedIn){showApp();await refresh()}}catch(e){}}
 function showApp(){loginCard.classList.add('hidden');app.classList.remove('hidden')}
@@ -1599,8 +1603,7 @@ async function refresh(){let [l,c]=await Promise.all([api('/admin/api/list'),api
 function fillCategories(){rCategory.innerHTML=categories.map(c=>`<option>${esc(c)}</option>`).join('')}
 function renderTabs(){let names=['전체','미지정',...categories.filter(c=>c!=='미지정')];tabs.innerHTML=names.map(c=>`<button class="tab ${selectedCategory===c?'active':''}" onclick="selectCat('${js(c)}')">${esc(c)}</button>`).join('')+`<button class="tab" onclick="addCategory()">＋</button>`}
 function selectCat(c){selectedCategory=c;renderTabs();renderList()}
-function toggleTrash(){showTrash=!showTrash;trashBtn.textContent=showTrash?'인증키 보기':'휴지통 보기';renderList()}
-function filtered(){let q=search.value.trim().toLowerCase();return items.filter(x=>{let deleted=!!x.deletedAt;if(showTrash!==deleted)return false;if(!showTrash&&selectedCategory!=='전체'&&(x.category||'미지정')!==selectedCategory)return false;return !q||[x.code,x.name,x.phone].some(v=>(v||'').toLowerCase().includes(q))})}
+function filtered(){let q=search.value.trim().toLowerCase();return items.filter(x=>{if(x.deletedAt)return false;if(selectedCategory!=='전체'&&(x.category||'미지정')!==selectedCategory)return false;return !q||[x.code,x.name,x.phone].some(v=>(v||'').toLowerCase().includes(q))})}
 function renderList(){let a=filtered();list.innerHTML=a.length?a.map(x=>`<div class="item" onclick="openItem('${js(x.code)}')"><div class="itemtop"><b>${esc(x.name||'')}</b><span class="badge ${(x.deletedAt?'deleted':(!x.enabled?'inactive':''))}">${x.deletedAt?'삭제됨':(x.enabled?'활성':'비활성')}</span></div><div class="muted">${esc(x.phone||'')} · ${esc(x.category||'미지정')} · ${esc(x.date||'')}</div><div class="code">${esc(x.code)}</div></div>`).join(''):'<p class="muted">표시할 인증키가 없습니다.</p>'}
 function openItem(code){selected=items.find(x=>x.code===code);if(!selected)return;detail.innerHTML=`<label>성함</label><div>${esc(selected.name||'')}</div><label>전화번호</label><div>${esc(selected.phone||'')}</div><label>인증키</label><div class="code">${esc(selected.code)}</div><label>삭제 비밀번호</label><div>${esc(selected.delete_password||'')}</div><label>카테고리</label><div>${esc(selected.category||'미지정')}</div><label>등록일</label><div>${esc(selected.date||'')}</div><label>상태</label><div>${selected.deletedAt?'삭제됨':(selected.enabled?'활성':'비활성')}</div>`;modal.classList.remove('hidden')}
 function closeModal(){modal.classList.add('hidden');selected=null}
@@ -1611,11 +1614,13 @@ function categoryCount(name){return items.filter(x=>(x.category||'미지정')===
 function renderCategoryManager(){let names=['미지정',...categories.filter(c=>c!=='미지정')];categoryManageList.innerHTML=names.map(n=>{let isDefault=n==='미지정';return `<div class="item" style="cursor:default"><div class="row" style="justify-content:space-between;align-items:center"><div><b>${esc(n)}</b><div class="muted">인증키 ${categoryCount(n)}개</div></div><div class="row">${isDefault?'<span class="muted">기본 카테고리</span>':`<button onclick="renameCategory('${js(n)}')">수정</button><button class="danger" onclick="deleteCategory('${js(n)}')">삭제</button>`}</div></div></div>`}).join('')}
 async function renameCategory(oldName){let n=prompt('새 카테고리 이름',oldName);if(n===null)return;n=n.trim();if(!n||n===oldName)return;try{let r=await api('/admin/api/categories/rename',{method:'POST',body:JSON.stringify({oldName:oldName,newName:n})});if(selectedCategory===oldName)selectedCategory=n;await refresh();renderCategoryManager();alert('카테고리 수정 완료\n인증키 '+(r.moved||0)+'개가 '+n+' 카테고리로 이동했습니다.')}catch(e){alert('카테고리 수정 실패: '+e.message)}}
 async function deleteCategory(n){if(!n||n==='미지정')return;if(!confirm('카테고리 '+n+' 을(를) 삭제할까요?\n안에 있는 인증키는 삭제되지 않고 미지정으로 이동합니다.'))return;try{let r=await api('/admin/api/categories/delete',{method:'POST',body:JSON.stringify({name:n})});if(selectedCategory===n)selectedCategory='전체';await refresh();renderCategoryManager();alert('카테고리 삭제 완료\n인증키 '+(r.movedToUnspecified||0)+'개가 미지정으로 이동했습니다.')}catch(e){alert('카테고리 삭제 실패: '+e.message)}}
-async function restoreBackupFile(input){let f=input.files&&input.files[0];if(!f)return;try{if(!confirm('선택한 ZIP 백업 시점의 전체 서버 내용으로 복원할까요?\n현재 서버 내용은 백업 내용으로 교체됩니다.')){input.value='';return}let raw=await f.arrayBuffer();let r=await fetch('/admin/api/restore-backup',{method:'POST',headers:{'Content-Type':f.type||'application/octet-stream','X-Backup-Filename':f.name},body:raw});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));alert((data.type==='json'?'JSON':'ZIP')+' 복원 완료\n인증키 '+(data.records||0)+'개 / 카테고리 '+(data.categories||0)+'개');await refresh()}catch(e){alert('백업 복원 실패: '+e.message)}finally{input.value=''}}
+async function restoreBackupFile(input){let f=input.files&&input.files[0];if(!f)return;try{if(!confirm('선택한 백업 ZIP 내부 JSON 기준으로 전체 서버 내용을 복원할까요?\n현재 서버 내용은 백업 내용으로 교체됩니다.')){input.value='';return}let raw=await f.arrayBuffer();let r=await fetch('/admin/api/restore-backup',{method:'POST',headers:{'Content-Type':f.type||'application/octet-stream','X-Backup-Filename':f.name},body:raw});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));alert((data.type==='json'?'JSON':'ZIP')+' 복원 완료\n인증키 '+(data.records||0)+'개 / 카테고리 '+(data.categories||0)+'개');await refresh()}catch(e){alert('백업 복원 실패: '+e.message)}finally{input.value=''}}
 async function changeCategory(){if(!selected)return;let n=prompt('변경할 카테고리\n현재: '+(selected.category||'미지정')+'\n\n기존 카테고리: '+categories.join(', '),selected.category||'미지정');if(n===null)return;n=n.trim()||'미지정';if(n!=='미지정'&&!categories.includes(n))await api('/admin/api/categories',{method:'POST',body:JSON.stringify({name:n})});await api('/admin/api/category',{method:'POST',body:JSON.stringify({code:selected.code,category:n})});closeModal();await refresh()}
 async function activateSelected(){if(!selected)return;await api('/admin/api/activate',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
 async function deactivateSelected(){if(!selected)return;await api('/admin/api/deactivate',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
-async function editSelected(){if(!selected)return;let name=prompt('성함',selected.name||'');if(name===null)return;let phone=prompt('전화번호 끝 4자리',selected.phone||'');if(phone===null)return;let code=prompt('인증키',selected.code);if(code===null)return;let pwd=prompt('삭제 비밀번호',selected.delete_password||'');if(pwd===null)return;let cat=prompt('카테고리',selected.category||'미지정');if(cat===null)return;await api('/admin/api/update',{method:'POST',body:JSON.stringify({originalCode:selected.code,name:name.trim(),phoneLast4:phone.trim(),code:code.trim(),deletePassword:pwd,category:cat.trim()||'미지정'})});closeModal();await refresh()}
+function editSelected(){if(!selected)return;eName.value=selected.name||'';ePhone.value=selected.phone||'';eCode.value=selected.code||'';ePwd.value=selected.delete_password||'';eCategory.innerHTML=categories.map(c=>`<option>${esc(c)}</option>`).join('');eCategory.value=selected.category||'미지정';editAuthModal.classList.remove('hidden')}
+function closeEditAuthModal(){editAuthModal.classList.add('hidden')}
+async function saveEditSelected(){if(!selected)return;let name=eName.value.trim(),phone=ePhone.value.trim(),code=eCode.value.trim(),pwd=ePwd.value,cat=eCategory.value||'미지정';if(!name||!/^[0-9]{4}$/.test(phone)||!code||!pwd){alert('성함 / 전화번호 4자리 / 인증키 / 비밀번호를 모두 입력하세요.');return}try{await api('/admin/api/update',{method:'POST',body:JSON.stringify({originalCode:selected.code,name:name,phoneLast4:phone,code:code,deletePassword:pwd,category:cat})});closeEditAuthModal();closeModal();await refresh();alert('수정 완료')}catch(e){alert('수정 실패: '+e.message)}}
 async function deleteSelected(){if(!selected||!confirm('이 인증키를 서버에서 완전히 삭제할까요?\n삭제 후에는 복구할 수 없습니다.'))return;await api('/admin/api/delete',{method:'POST',body:JSON.stringify({code:selected.code})});closeModal();await refresh()}
 async function registerCode(){let o={name:rName.value.trim(),phoneLast4:rPhone.value.trim(),category:rCategory.value||'미지정',code:rCode.value.trim(),deletePassword:rPwd.value};if(!o.name||!/^[0-9]{4}$/.test(o.phoneLast4)||!o.code||!o.deletePassword){alert('성함 / 전화번호 4자리 / 인증키 / 비밀번호를 모두 입력하세요.');return}try{await api('/admin/api/register',{method:'POST',body:JSON.stringify(o)});clearRegister();await refresh();alert('업로드 완료')}catch(e){alert('업로드 실패: '+e.message)}}
 function clearRegister(){rName.value='';rPhone.value='';rCode.value='';rPwd.value='';rCategory.value='미지정'}
