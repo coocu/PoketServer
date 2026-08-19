@@ -29,6 +29,9 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET", "poket-admin-session-v1-change
 APPLE_ADMIN_FILE = os.environ.get("APPLE_ADMIN_FILE", "apple_admins.json")
 APPLE_CLIENT_ID = os.environ.get("APPLE_CLIENT_ID", "com.codenote.id")
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+GOOGLE_ADMIN_FILE = os.environ.get("GOOGLE_ADMIN_FILE", "google_admins.json")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 DATA_FILE_EXISTED_AT_BOOT = os.path.exists(DATA_FILE)
 
 KST = ZoneInfo("Asia/Seoul")
@@ -171,9 +174,41 @@ def save_apple_admins():
         _atomic_json_save(APPLE_ADMIN_FILE, apple_admins)
 
 
+def _normalize_google_admin(record: dict) -> dict:
+    record.setdefault("provider", "google")
+    record.setdefault("label", "")
+    record.setdefault("registeredAt", now_kst().isoformat(timespec="seconds"))
+    record.setdefault("allowedCategory", None)
+    return record
+
+
+def load_google_admins():
+    if not os.path.exists(GOOGLE_ADMIN_FILE):
+        return {}
+    try:
+        with open(GOOGLE_ADMIN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("google_admins.json must be a JSON object")
+        normalized = {}
+        for key, value in data.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                raise ValueError("invalid google admin record")
+            normalized[key] = _normalize_google_admin(dict(value))
+        return normalized
+    except Exception as exc:
+        raise RuntimeError(f"Google 관리자 데이터 로드 실패: {exc}") from exc
+
+
+def save_google_admins():
+    with _db_lock:
+        _atomic_json_save(GOOGLE_ADMIN_FILE, google_admins)
+
+
 auth_db = load_data()
 categories = load_categories()
 apple_admins = load_apple_admins()
+google_admins = load_google_admins()
 
 
 def ensure_bootstrap_developer_key():
@@ -284,13 +319,49 @@ class AppleAdminUpdateRequest(BaseModel):
     userId: str
     label: str
     allowedCategory: Optional[str] = None
+    provider: Optional[str] = "apple"
 
 
 class AppleAdminDeleteRequest(BaseModel):
     userId: str
+    provider: Optional[str] = "apple"
 
 
 class AppleAdminUploadRequest(BaseModel):
+    name: str
+    phoneLast4: str
+    code: str
+    deletePassword: str
+    category: str = "미지정"
+
+
+class GoogleIdentityRequest(BaseModel):
+    idToken: str
+    nonce: str
+
+
+class GoogleAdminRegisterRequest(BaseModel):
+    idToken: str
+    nonce: str
+    label: str
+    code: str
+
+
+class GoogleAdminManageAccessRequest(BaseModel):
+    code: str
+
+
+class GoogleAdminUpdateRequest(BaseModel):
+    userId: str
+    label: str
+    allowedCategory: Optional[str] = None
+
+
+class GoogleAdminDeleteRequest(BaseModel):
+    userId: str
+
+
+class GoogleAdminUploadRequest(BaseModel):
     name: str
     phoneLast4: str
     code: str
@@ -440,6 +511,82 @@ def require_manage_token(request: Request, user_id: str):
         raise HTTPException(status_code=401, detail="manage_access_denied")
 
 
+_google_jwk_client = PyJWKClient(GOOGLE_JWKS_URL)
+_google_session_serializer = URLSafeSerializer(SESSION_SECRET, salt="codenote-google-admin-session-v1")
+_google_manage_serializer = URLSafeTimedSerializer(SESSION_SECRET, salt="codenote-google-admin-manage-v1")
+
+
+def verify_google_identity_token(id_token: str, nonce: str) -> str:
+    token = (id_token or "").strip()
+    expected_nonce = (nonce or "").strip()
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="google_client_id_not_configured")
+    if not token or not expected_nonce:
+        raise HTTPException(status_code=401, detail="invalid_google_credential")
+    try:
+        signing_key = _google_jwk_client.get_signing_key_from_jwt(token)
+        claims = jwt.decode(token, signing_key.key, algorithms=["RS256"], audience=GOOGLE_CLIENT_ID, options={"require": ["exp", "iss", "aud", "sub"]})
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="invalid_google_credential") from exc
+    if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        raise HTTPException(status_code=401, detail="invalid_google_issuer")
+    if str(claims.get("nonce") or "") != expected_nonce:
+        raise HTTPException(status_code=401, detail="invalid_google_nonce")
+    user_id = str(claims.get("sub") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="invalid_google_user")
+    return user_id
+
+
+def issue_google_session(user_id: str) -> str:
+    return _google_session_serializer.dumps({"provider": "google", "userId": user_id})
+
+
+def google_admin_profile(user_id: str) -> dict:
+    record = google_admins.get(user_id)
+    if not record:
+        raise HTTPException(status_code=401, detail="google_admin_not_registered")
+    record = _normalize_google_admin(record)
+    return {"userId": user_id, "provider": "google", "label": record.get("label", ""), "registeredAt": record.get("registeredAt", ""), "allowedCategory": record.get("allowedCategory")}
+
+
+def require_google_session_token(token: str) -> tuple[str, dict]:
+    token = (token or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="google_login_required")
+    try:
+        payload = _google_session_serializer.loads(token)
+    except BadSignature as exc:
+        raise HTTPException(status_code=401, detail="invalid_google_session") from exc
+    user_id = str(payload.get("userId") or "").strip() if isinstance(payload, dict) else ""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="invalid_google_session")
+    with _db_lock:
+        if user_id not in google_admins:
+            raise HTTPException(status_code=401, detail="google_admin_removed")
+        return user_id, google_admin_profile(user_id)
+
+
+def require_google_session(request: Request) -> tuple[str, dict]:
+    return require_google_session_token(request.headers.get("X-Google-Session", ""))
+
+
+def issue_google_manage_token(user_id: str) -> str:
+    return _google_manage_serializer.dumps({"userId": user_id})
+
+
+def require_google_manage_token(request: Request, user_id: str):
+    token = request.headers.get("X-Manage-Token", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="manage_access_required")
+    try:
+        payload = _google_manage_serializer.loads(token, max_age=60 * 15)
+    except (BadSignature, SignatureExpired) as exc:
+        raise HTTPException(status_code=401, detail="manage_access_expired") from exc
+    if not isinstance(payload, dict) or payload.get("userId") != user_id:
+        raise HTTPException(status_code=401, detail="manage_access_denied")
+
+
 def validate_upload_category(profile: dict, requested: str) -> str:
     allowed = profile.get("allowedCategory")
     if allowed is None or str(allowed).strip() == "":
@@ -453,12 +600,18 @@ def validate_upload_category(profile: dict, requested: str) -> str:
 
 
 @app.middleware("http")
-async def enforce_registered_apple_admin_for_iphone_requests(request: Request, call_next):
-    # 기존 앱은 이 헤더를 보내지 않으므로 기존 API 동작은 그대로 유지됩니다.
-    token = request.headers.get("X-Apple-Session", "")
-    if token:
+async def enforce_registered_federated_admin_sessions(request: Request, call_next):
+    # 기존 앱은 이 헤더들을 보내지 않으므로 기존 API 동작은 그대로 유지됩니다.
+    apple_token = request.headers.get("X-Apple-Session", "")
+    if apple_token:
         try:
-            require_apple_session_token(token)
+            require_apple_session_token(apple_token)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    google_token = request.headers.get("X-Google-Session", "")
+    if google_token:
+        try:
+            require_google_session_token(google_token)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     return await call_next(request)
@@ -565,9 +718,13 @@ def rename_category_and_reassign(old_name: str, new_name: str) -> int:
         for admin_record in apple_admins.values():
             if admin_record.get("allowedCategory") == old_name:
                 admin_record["allowedCategory"] = new_name
+        for admin_record in google_admins.values():
+            if admin_record.get("allowedCategory") == old_name:
+                admin_record["allowedCategory"] = new_name
         save_data()
         save_categories()
         save_apple_admins()
+        save_google_admins()
         return moved
 
 
@@ -595,9 +752,13 @@ def delete_category_and_reassign(name: str) -> int:
         for admin_record in apple_admins.values():
             if admin_record.get("allowedCategory") == name:
                 admin_record["allowedCategory"] = None
+        for admin_record in google_admins.values():
+            if admin_record.get("allowedCategory") == name:
+                admin_record["allowedCategory"] = None
         save_data()
         save_categories()
         save_apple_admins()
+        save_google_admins()
         return moved
 
 
@@ -607,6 +768,7 @@ def build_full_backup_zip() -> bytes:
         auth_snapshot = {code: dict(data) for code, data in auth_db.items()}
         category_snapshot = list(categories)
         apple_admin_snapshot = {user_id: dict(data) for user_id, data in apple_admins.items()}
+        google_admin_snapshot = {user_id: dict(data) for user_id, data in google_admins.items()}
 
     manifest = {
         "format": "codenote-auth-backup",
@@ -615,6 +777,7 @@ def build_full_backup_zip() -> bytes:
         "records": len(auth_snapshot),
         "categories": len(category_snapshot),
         "appleAdmins": len(apple_admin_snapshot),
+        "googleAdmins": len(google_admin_snapshot),
     }
 
     out = io.BytesIO()
@@ -623,6 +786,7 @@ def build_full_backup_zip() -> bytes:
         zf.writestr("auth_data.json", json.dumps(auth_snapshot, ensure_ascii=False, indent=2))
         zf.writestr("auth_categories.json", json.dumps(category_snapshot, ensure_ascii=False, indent=2))
         zf.writestr("apple_admins.json", json.dumps(apple_admin_snapshot, ensure_ascii=False, indent=2))
+        zf.writestr("google_admins.json", json.dumps(google_admin_snapshot, ensure_ascii=False, indent=2))
     return out.getvalue()
 
 
@@ -647,6 +811,10 @@ def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
             incoming_apple_admins = (
                 json.loads(zf.read(members["apple_admins.json"]).decode("utf-8-sig"))
                 if "apple_admins.json" in members else None
+            )
+            incoming_google_admins = (
+                json.loads(zf.read(members["google_admins.json"]).decode("utf-8-sig"))
+                if "google_admins.json" in members else None
             )
     except HTTPException:
         raise
@@ -691,6 +859,16 @@ def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
                 raise HTTPException(status_code=400, detail="invalid_apple_admin_record")
             normalized_apple_admins[user_id] = _normalize_apple_admin(dict(record))
 
+    normalized_google_admins = None
+    if incoming_google_admins is not None:
+        if not isinstance(incoming_google_admins, dict):
+            raise HTTPException(status_code=400, detail="invalid_google_admins")
+        normalized_google_admins = {}
+        for user_id, record in incoming_google_admins.items():
+            if not isinstance(user_id, str) or not user_id.strip() or not isinstance(record, dict):
+                raise HTTPException(status_code=400, detail="invalid_google_admin_record")
+            normalized_google_admins[user_id] = _normalize_google_admin(dict(record))
+
     with _db_lock:
         auth_db.clear()
         auth_db.update(normalized_db)
@@ -698,11 +876,16 @@ def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
         if normalized_apple_admins is not None:
             apple_admins.clear()
             apple_admins.update(normalized_apple_admins)
+        if normalized_google_admins is not None:
+            google_admins.clear()
+            google_admins.update(normalized_google_admins)
         # _atomic_json_save가 현재 서버 파일을 .bak로 남긴 뒤 교체합니다.
         save_data()
         save_categories()
         if normalized_apple_admins is not None:
             save_apple_admins()
+        if normalized_google_admins is not None:
+            save_google_admins()
 
     return len(normalized_db), len(normalized_categories)
 
@@ -1125,6 +1308,139 @@ def apple_admin_delete(req: AppleAdminDeleteRequest, request: Request):
 
 
 # ============================================================
+#   Google 로그인 / Android 관리자 권한 API (기존 API와 분리)
+# ============================================================
+@app.get("/google-admin/config")
+def google_admin_config():
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="google_client_id_not_configured")
+    return {"clientId": GOOGLE_CLIENT_ID}
+
+
+@app.post("/google-admin/login")
+def google_admin_login(req: GoogleIdentityRequest):
+    user_id = verify_google_identity_token(req.idToken, req.nonce)
+    with _db_lock:
+        if user_id not in google_admins:
+            return {"registered": False}
+        profile = google_admin_profile(user_id)
+    return {"registered": True, "sessionToken": issue_google_session(user_id), "profile": profile}
+
+
+@app.post("/google-admin/register")
+def google_admin_register(req: GoogleAdminRegisterRequest):
+    user_id = verify_google_identity_token(req.idToken, req.nonce)
+    label = (req.label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label_required")
+    validate_and_consume_kyh_code(req.code)
+    with _db_lock:
+        if user_id not in google_admins:
+            google_admins[user_id] = {"provider": "google", "label": label, "registeredAt": now_kst().isoformat(timespec="seconds"), "allowedCategory": None}
+        else:
+            google_admins[user_id]["label"] = label
+        save_google_admins()
+        profile = google_admin_profile(user_id)
+    return {"status": "ok", "sessionToken": issue_google_session(user_id), "profile": profile}
+
+
+@app.get("/google-admin/session")
+def google_admin_session(request: Request):
+    _, profile = require_google_session(request)
+    return {"status": "ok", "profile": profile}
+
+
+@app.get("/google-admin/upload-categories")
+def google_admin_upload_categories(request: Request):
+    _, profile = require_google_session(request)
+    allowed = profile.get("allowedCategory")
+    if allowed is None or str(allowed).strip() == "":
+        return {"categories": [], "allowedCategory": None, "canAddCategory": False}
+    if allowed == "전체":
+        return {"categories": ["미지정"] + sorted(categories, key=lambda x: x.lower()), "allowedCategory": "전체", "canAddCategory": True}
+    return {"categories": [str(allowed)], "allowedCategory": str(allowed), "canAddCategory": False}
+
+
+@app.post("/google-admin/upload-categories")
+def google_admin_add_upload_category(req: CategoryRequest, request: Request):
+    _, profile = require_google_session(request)
+    if profile.get("allowedCategory") != "전체":
+        raise HTTPException(status_code=403, detail="category_add_not_allowed")
+    name = clean_category(req.name)
+    if name != "미지정":
+        with _db_lock:
+            if name not in categories:
+                categories.append(name)
+                save_categories()
+    return {"status": "ok", "category": name}
+
+
+@app.post("/google-admin/upload")
+def google_admin_upload(req: GoogleAdminUploadRequest, request: Request):
+    _, profile = require_google_session(request)
+    validate_phone(req.phoneLast4)
+    category = validate_upload_category(profile, req.category)
+    register(RegisterRequest(name=req.name, phoneLast4=req.phoneLast4, code=req.code))
+    approve(CodeRequest(code=req.code))
+    set_delete_pwd(PasswordRequest(password=req.deletePassword, code=req.code))
+    set_category_for_code(req.code, category)
+    return {"status": "ok", "code": req.code, "category": category}
+
+
+@app.post("/google-admin/manage-access")
+def google_admin_manage_access(req: GoogleAdminManageAccessRequest, request: Request):
+    user_id, _ = require_google_session(request)
+    validate_and_consume_kyh_code(req.code)
+    return {"status": "ok", "manageToken": issue_google_manage_token(user_id)}
+
+
+@app.get("/google-admin/admins")
+def google_admin_list(request: Request):
+    user_id, _ = require_google_session(request)
+    require_google_manage_token(request, user_id)
+    with _db_lock:
+        items = [google_admin_profile(uid) for uid in google_admins.keys()]
+    items.sort(key=lambda x: x.get("registeredAt") or "", reverse=True)
+    return {"items": items}
+
+
+@app.post("/google-admin/admins/update")
+def google_admin_update(req: GoogleAdminUpdateRequest, request: Request):
+    user_id, _ = require_google_session(request)
+    require_google_manage_token(request, user_id)
+    label = (req.label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label_required")
+    allowed = req.allowedCategory
+    if allowed is not None:
+        allowed = str(allowed).strip()
+        if not allowed:
+            allowed = None
+    if allowed not in (None, "전체", "미지정") and allowed not in categories:
+        raise HTTPException(status_code=400, detail="category_not_found")
+    with _db_lock:
+        if req.userId not in google_admins:
+            raise HTTPException(status_code=404, detail="google_admin_not_found")
+        google_admins[req.userId]["label"] = label
+        google_admins[req.userId]["allowedCategory"] = allowed
+        save_google_admins()
+        profile = google_admin_profile(req.userId)
+    return {"status": "ok", "profile": profile}
+
+
+@app.post("/google-admin/admins/delete")
+def google_admin_delete(req: GoogleAdminDeleteRequest, request: Request):
+    user_id, _ = require_google_session(request)
+    require_google_manage_token(request, user_id)
+    with _db_lock:
+        if req.userId not in google_admins:
+            raise HTTPException(status_code=404, detail="google_admin_not_found")
+        del google_admins[req.userId]
+        save_google_admins()
+    return {"status": "ok", "deletedSelf": req.userId == user_id}
+
+
+# ============================================================
 #   iPhone 관리자용 확장 API
 # ============================================================
 def require_manager(admin: str):
@@ -1482,9 +1798,10 @@ async def web_delete(req: CodeRequest, request: Request):
 
 @app.get("/admin/api/apple-admins")
 async def web_apple_admins(request: Request):
+    # 기존 경로명은 호환을 위해 유지하고 Apple/Google 관리자 모두 반환합니다.
     require_web_login(request)
     with _db_lock:
-        items = [apple_admin_profile(uid) for uid in apple_admins.keys()]
+        items = [apple_admin_profile(uid) for uid in apple_admins.keys()] + [google_admin_profile(uid) for uid in google_admins.keys()]
     items.sort(key=lambda x: x.get("registeredAt") or "", reverse=True)
     return {"items": items}
 
@@ -1497,26 +1814,43 @@ async def web_apple_admin_update(req: AppleAdminUpdateRequest, request: Request)
         raise HTTPException(status_code=400, detail="label_required")
     allowed = req.allowedCategory
     if allowed is not None:
-        allowed = str(allowed).strip() or None
+        allowed = str(allowed).strip()
+        if not allowed:
+            allowed = None
     if allowed not in (None, "전체", "미지정") and allowed not in categories:
         raise HTTPException(status_code=400, detail="category_not_found")
+    provider = (req.provider or "apple").strip().lower()
     with _db_lock:
-        if req.userId not in apple_admins:
-            raise HTTPException(status_code=404, detail="apple_admin_not_found")
-        apple_admins[req.userId]["label"] = label
-        apple_admins[req.userId]["allowedCategory"] = allowed
-        save_apple_admins()
+        if provider == "google":
+            if req.userId not in google_admins:
+                raise HTTPException(status_code=404, detail="google_admin_not_found")
+            google_admins[req.userId]["label"] = label
+            google_admins[req.userId]["allowedCategory"] = allowed
+            save_google_admins()
+        else:
+            if req.userId not in apple_admins:
+                raise HTTPException(status_code=404, detail="apple_admin_not_found")
+            apple_admins[req.userId]["label"] = label
+            apple_admins[req.userId]["allowedCategory"] = allowed
+            save_apple_admins()
     return {"status": "ok"}
 
 
 @app.post("/admin/api/apple-admins/delete")
 async def web_apple_admin_delete(req: AppleAdminDeleteRequest, request: Request):
     require_web_login(request)
+    provider = (req.provider or "apple").strip().lower()
     with _db_lock:
-        if req.userId not in apple_admins:
-            raise HTTPException(status_code=404, detail="apple_admin_not_found")
-        del apple_admins[req.userId]
-        save_apple_admins()
+        if provider == "google":
+            if req.userId not in google_admins:
+                raise HTTPException(status_code=404, detail="google_admin_not_found")
+            del google_admins[req.userId]
+            save_google_admins()
+        else:
+            if req.userId not in apple_admins:
+                raise HTTPException(status_code=404, detail="apple_admin_not_found")
+            del apple_admins[req.userId]
+            save_apple_admins()
     return {"status": "ok"}
 
 
@@ -1529,6 +1863,7 @@ async def web_export_json(request: Request):
         "auth_db": auth_db,
         "categories": categories,
         "apple_admins": apple_admins,
+        "google_admins": google_admins,
     }
     return JSONResponse(
         payload,
@@ -1630,9 +1965,9 @@ function openBackupModal(){backupModal.classList.remove('hidden')}
 function closeBackupModal(){backupModal.classList.add('hidden')}
 async function openAppleAdminManager(){try{let r=await api('/admin/api/apple-admins');renderAppleAdminManager(r.items||[]);appleAdminModal.classList.remove('hidden')}catch(e){alert('인증 등록 내역 불러오기 실패: '+e.message)}}
 function closeAppleAdminManager(){appleAdminModal.classList.add('hidden')}
-function renderAppleAdminManager(a){appleAdminList.innerHTML=a.length?a.map(x=>`<div class="item" style="cursor:default"><div class="itemtop"><b>${esc(x.label||'')}</b><span class="badge">${esc(x.allowedCategory||'권한 미설정')}</span></div><div class="muted">${esc(x.registeredAt||'')}</div><div class="code">${esc(x.userId||'')}</div><div class="row" style="margin-top:10px"><button onclick="editAppleAdmin('${js(x.userId)}','${js(x.label||'')}','${js(x.allowedCategory||'') }')">수정</button><button class="danger" onclick="deleteAppleAdmin('${js(x.userId)}')">삭제</button></div></div>`).join(''):'<p class="muted">등록된 Apple 관리자가 없습니다.</p>'}
-async function editAppleAdmin(userId,label,currentCategory){let newLabel=prompt('등록 문구',label);if(newLabel===null)return;newLabel=newLabel.trim();if(!newLabel)return alert('등록 문구를 입력하세요.');let guide='허용 카테고리 입력\n전체 또는 카테고리 이름\n비워두면 권한 미설정\n\n현재 카테고리: '+categories.join(', ');let allowed=prompt(guide,currentCategory||'');if(allowed===null)return;allowed=allowed.trim();let payload={userId:userId,label:newLabel,allowedCategory:allowed||null};try{await api('/admin/api/apple-admins/update',{method:'POST',body:JSON.stringify(payload)});await openAppleAdminManager();alert('수정 완료')}catch(e){alert('수정 실패: '+e.message)}}
-async function deleteAppleAdmin(userId){if(!confirm('이 관리자 등록을 삭제할까요?\n해당 계정은 다음 요청부터 앱을 사용할 수 없습니다.'))return;try{await api('/admin/api/apple-admins/delete',{method:'POST',body:JSON.stringify({userId:userId})});await openAppleAdminManager();alert('삭제 완료')}catch(e){alert('삭제 실패: '+e.message)}}
+function renderAppleAdminManager(a){appleAdminList.innerHTML=a.length?a.map(x=>`<div class="item" style="cursor:default"><div class="itemtop"><b>${esc(x.label||'')}</b><span class="badge">${esc(x.allowedCategory||'권한 미설정')}</span></div><div class="muted">${x.provider==='google'?'Google':'Apple'} · ${esc(x.registeredAt||'')}</div><div class="code">${esc(x.userId||'')}</div><div class="row" style="margin-top:10px"><button onclick="editAppleAdmin('${js(x.provider||'apple')}','${js(x.userId)}','${js(x.label||'')}','${js(x.allowedCategory||'') }')">수정</button><button class="danger" onclick="deleteAppleAdmin('${js(x.provider||'apple')}','${js(x.userId)}')">삭제</button></div></div>`).join(''):'<p class="muted">등록된 관리자가 없습니다.</p>'}
+async function editAppleAdmin(provider,userId,label,currentCategory){let newLabel=prompt('등록 문구',label);if(newLabel===null)return;newLabel=newLabel.trim();if(!newLabel)return alert('등록 문구를 입력하세요.');let guide='허용 카테고리 입력\n전체 또는 카테고리 이름\n비워두면 권한 미설정\n\n현재 카테고리: '+categories.join(', ');let allowed=prompt(guide,currentCategory||'');if(allowed===null)return;allowed=allowed.trim();let payload={provider:provider,userId:userId,label:newLabel,allowedCategory:allowed||null};try{await api('/admin/api/apple-admins/update',{method:'POST',body:JSON.stringify(payload)});await openAppleAdminManager();alert('수정 완료')}catch(e){alert('수정 실패: '+e.message)}}
+async function deleteAppleAdmin(provider,userId){if(!confirm('이 관리자 등록을 삭제할까요?\n해당 계정은 다음 요청부터 앱을 사용할 수 없습니다.'))return;try{await api('/admin/api/apple-admins/delete',{method:'POST',body:JSON.stringify({provider:provider,userId:userId})});await openAppleAdminManager();alert('삭제 완료')}catch(e){alert('삭제 실패: '+e.message)}}
 boot();
 </script></body></html>'''
 
