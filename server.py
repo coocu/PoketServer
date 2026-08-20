@@ -40,6 +40,14 @@ APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "").strip()
 APNS_BUNDLE_ID = os.environ.get("APNS_BUNDLE_ID", APPLE_CLIENT_ID).strip() or APPLE_CLIENT_ID
 APNS_PRIVATE_KEY = os.environ.get("APNS_PRIVATE_KEY", "")
 APNS_PRIVATE_KEY_BASE64 = os.environ.get("APNS_PRIVATE_KEY_BASE64", "").strip()
+
+# Android FCM 설정. 로그인 방식과 무관하며 승인 알림 전송에만 사용합니다.
+FCM_PROJECT_ID = os.environ.get("FCM_PROJECT_ID", "").strip()
+FCM_API_KEY = os.environ.get("FCM_API_KEY", "").strip()
+FCM_APP_ID = os.environ.get("FCM_APP_ID", "").strip()
+FCM_SENDER_ID = os.environ.get("FCM_SENDER_ID", "").strip()
+FCM_SERVICE_ACCOUNT_JSON_BASE64 = os.environ.get("FCM_SERVICE_ACCOUNT_JSON_BASE64", "").strip()
+ANDROID_PUSH_FILE = os.environ.get("ANDROID_PUSH_FILE", str(Path(DATA_FILE).with_name("android_push_tokens.json")))
 DATA_FILE_EXISTED_AT_BOOT = os.path.exists(DATA_FILE)
 
 KST = ZoneInfo("Asia/Seoul")
@@ -126,10 +134,7 @@ def load_categories():
             with open(CATEGORY_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             if isinstance(raw, list):
-                for value in raw:
-                    name = str(value).strip()
-                    if name and name != "미지정" and name not in categories:
-                        categories.append(name)
+                categories = [str(x).strip() for x in raw if str(x).strip() and str(x).strip() != "미지정"]
         except Exception:
             categories = []
 
@@ -139,7 +144,16 @@ def load_categories():
         if category and category != "미지정" and category not in categories:
             categories.append(category)
 
-    return categories
+    # auth_categories.json에 저장된 순서를 그대로 유지합니다.
+    # set/sorted를 사용하면 관리자가 지정한 카테고리 순서가 사라지므로
+    # 중복만 제거하고 최초 등장 순서를 보존합니다.
+    cleaned = []
+    seen = set()
+    for category in categories:
+        if category not in seen:
+            seen.add(category)
+            cleaned.append(category)
+    return cleaned
 
 
 def save_data():
@@ -149,11 +163,15 @@ def save_data():
 
 def save_categories():
     with _db_lock:
+        # 관리자에서 지정한 순서를 그대로 저장합니다.
         cleaned = []
+        seen = set()
         for value in categories:
             name = str(value).strip()
-            if name and name != "미지정" and name not in cleaned:
-                cleaned.append(name)
+            if not name or name == "미지정" or name in seen:
+                continue
+            seen.add(name)
+            cleaned.append(name)
         categories[:] = cleaned
         _atomic_json_save(CATEGORY_FILE, categories)
 
@@ -319,8 +337,9 @@ class CategoryRenameRequest(BaseModel):
     newName: str
 
 
-class CategoryOrderRequest(BaseModel):
-    categories: list[str]
+class CategoryMoveRequest(BaseModel):
+    name: str
+    direction: str
 
 
 class CodeCategoryRequest(BaseModel):
@@ -391,6 +410,10 @@ class ApplePushTokenRequest(BaseModel):
 
 class ApprovalActionRequest(BaseModel):
     requestId: str
+
+
+class AndroidPushTokenRequest(BaseModel):
+    deviceToken: str
 
 
 # ============================================================
@@ -659,7 +682,7 @@ def create_approval_request(user_id: str, profile: dict, req: AppleAdminUploadRe
             "requestId": request_id,
             "requestedAt": now_kst().isoformat(timespec="seconds"),
             "requesterUserId": user_id,
-            "requesterLabel": str(profile.get("label") or ""),
+            "requesterLabel": str(profile.get("label") or profile.get("name") or ""),
             "name": (req.name or "").strip(),
             "phoneLast4": req.phoneLast4,
             "code": code,
@@ -671,6 +694,7 @@ def create_approval_request(user_id: str, profile: dict, req: AppleAdminUploadRe
 
     # 요청 저장이 성공한 뒤 푸시는 별도 스레드에서 전송합니다.
     threading.Thread(target=send_approval_push_to_full_admins, args=(dict(item),), daemon=True).start()
+    threading.Thread(target=send_android_approval_push_to_full_admins, args=(dict(item),), daemon=True).start()
     return item
 
 
@@ -815,6 +839,203 @@ def send_approval_push_to_full_admins(item: dict):
         return
 
 
+
+# Android 승인 알림 토큰은 운영 인증키 DB와 분리하여 저장합니다.
+def load_android_push_tokens():
+    if not os.path.exists(ANDROID_PUSH_FILE):
+        return {}
+    try:
+        with open(ANDROID_PUSH_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): [str(x) for x in v if str(x).strip()] for k, v in raw.items() if isinstance(v, list)}
+    except Exception:
+        return {}
+
+
+def save_android_push_tokens():
+    with _db_lock:
+        _atomic_json_save(ANDROID_PUSH_FILE, android_push_tokens)
+
+
+android_push_tokens = load_android_push_tokens()
+_fcm_token_lock = threading.RLock()
+_fcm_cached_access_token: Optional[str] = None
+_fcm_cached_access_token_until = 0
+
+
+def _fcm_service_account() -> Optional[dict]:
+    if not FCM_SERVICE_ACCOUNT_JSON_BASE64:
+        return None
+    try:
+        value = json.loads(base64.b64decode(FCM_SERVICE_ACCOUNT_JSON_BASE64).decode("utf-8"))
+        return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+
+
+def _fcm_access_token() -> Optional[str]:
+    global _fcm_cached_access_token, _fcm_cached_access_token_until
+    account = _fcm_service_account()
+    if not account:
+        return None
+    project_id = FCM_PROJECT_ID or str(account.get("project_id") or "").strip()
+    client_email = str(account.get("client_email") or "").strip()
+    private_key = str(account.get("private_key") or "")
+    token_uri = str(account.get("token_uri") or "https://oauth2.googleapis.com/token").strip()
+    if not project_id or not client_email or not private_key:
+        return None
+    now = int(time.time())
+    with _fcm_token_lock:
+        if _fcm_cached_access_token and now < _fcm_cached_access_token_until - 60:
+            return _fcm_cached_access_token
+        assertion = jwt.encode(
+            {
+                "iss": client_email,
+                "scope": "https://www.googleapis.com/auth/firebase.messaging",
+                "aud": token_uri,
+                "iat": now,
+                "exp": now + 3600,
+            },
+            private_key,
+            algorithm="RS256",
+        )
+        if isinstance(assertion, bytes):
+            assertion = assertion.decode("utf-8")
+        try:
+            response = httpx.post(
+                token_uri,
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                    "assertion": assertion,
+                },
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            body = response.json()
+            token = str(body.get("access_token") or "").strip()
+            expires = int(body.get("expires_in") or 3600)
+            if not token:
+                return None
+            _fcm_cached_access_token = token
+            _fcm_cached_access_token_until = now + expires
+            return token
+        except Exception:
+            return None
+
+
+def _remove_stale_android_push_token(token: str):
+    changed = False
+    with _db_lock:
+        for code in list(android_push_tokens.keys()):
+            before = len(android_push_tokens.get(code, []))
+            android_push_tokens[code] = [x for x in android_push_tokens.get(code, []) if x != token]
+            if not android_push_tokens[code]:
+                android_push_tokens.pop(code, None)
+            if len(android_push_tokens.get(code, [])) != before:
+                changed = True
+        if changed:
+            save_android_push_tokens()
+
+
+def send_android_approval_push_to_full_admins(item: dict):
+    access_token = _fcm_access_token()
+    account = _fcm_service_account()
+    project_id = FCM_PROJECT_ID or (str(account.get("project_id") or "").strip() if account else "")
+    if not access_token or not project_id:
+        return
+    with _db_lock:
+        targets = []
+        for source_code, tokens in android_push_tokens.items():
+            try:
+                profile = android_admin_profile_for_code(source_code, require_enabled=False)
+            except HTTPException:
+                continue
+            if profile.get("allowedCategory") == "전체":
+                targets.extend(tokens)
+    if not targets:
+        return
+    url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    data = {
+        "type": "auth_upload_approval",
+        "requestId": str(item.get("requestId") or ""),
+        "title": "인증키 승인 요청",
+        "body": f"{item.get('name','')} · {item.get('phoneLast4','')} · {item.get('category','미지정')}\n{item.get('code','')}",
+        "requesterLabel": str(item.get("requesterLabel") or ""),
+    }
+    for target in list(dict.fromkeys(targets)):
+        payload = {
+            "message": {
+                "token": target,
+                "data": data,
+                "android": {"priority": "high"},
+            }
+        }
+        try:
+            response = httpx.post(url, headers=headers, json=payload, timeout=10.0)
+            if response.status_code in (400, 404):
+                body = response.text
+                if "UNREGISTERED" in body or "registration-token-not-registered" in body:
+                    _remove_stale_android_push_token(target)
+        except Exception:
+            continue
+
+
+@app.get("/android-admin/push-config")
+def android_push_config(request: Request):
+    require_android_session(request)
+    return {
+        "projectId": FCM_PROJECT_ID,
+        "apiKey": FCM_API_KEY,
+        "appId": FCM_APP_ID,
+        "senderId": FCM_SENDER_ID,
+    }
+
+
+@app.post("/android-admin/push-token")
+def android_push_token(req: AndroidPushTokenRequest, request: Request):
+    source_code, profile = require_android_session(request)
+    if profile.get("allowedCategory") != "전체":
+        raise HTTPException(status_code=403, detail="full_permission_required")
+    token = (req.deviceToken or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="invalid_device_token")
+    with _db_lock:
+        tokens = [x for x in android_push_tokens.get(source_code, []) if x != token]
+        tokens.append(token)
+        android_push_tokens[source_code] = tokens[-5:]
+        save_android_push_tokens()
+    return {"status": "ok"}
+
+
+@app.get("/android-admin/approval-requests")
+def android_admin_approval_requests(request: Request):
+    _, profile = require_android_session(request)
+    if profile.get("allowedCategory") != "전체":
+        raise HTTPException(status_code=403, detail="full_permission_required")
+    return {"items": _approval_items_sorted()}
+
+
+@app.post("/android-admin/approval-requests/approve")
+def android_admin_approval_approve(req: ApprovalActionRequest, request: Request):
+    _, profile = require_android_session(request)
+    if profile.get("allowedCategory") != "전체":
+        raise HTTPException(status_code=403, detail="full_permission_required")
+    item = approve_pending_request(req.requestId)
+    return {"status": "ok", "code": item.get("code", "")}
+
+
+@app.post("/android-admin/approval-requests/delete")
+def android_admin_approval_delete(req: ApprovalActionRequest, request: Request):
+    _, profile = require_android_session(request)
+    if profile.get("allowedCategory") != "전체":
+        raise HTTPException(status_code=403, detail="full_permission_required")
+    item = delete_pending_request(req.requestId)
+    return {"status": "ok", "code": item.get("code", "")}
+
+
 @app.middleware("http")
 async def enforce_registered_apple_admin_for_iphone_requests(request: Request, call_next):
     # 기존 앱은 이 헤더를 보내지 않으므로 기존 API 동작은 그대로 유지됩니다.
@@ -920,10 +1141,11 @@ def rename_category_and_reassign(old_name: str, new_name: str) -> int:
                 data["category"] = new_name
                 moved += 1
 
-        # 이름만 수정할 때는 기존 카테고리 위치를 유지합니다.
+        # 이름만 바꿀 때는 현재 카테고리 위치를 그대로 유지합니다.
+        # 이미 존재하는 이름으로 변경하는 경우에는 기존 카테고리로 병합합니다.
         old_index = categories.index(old_name)
         if new_name in categories:
-            categories[:] = [c for c in categories if c != old_name]
+            categories.pop(old_index)
         else:
             categories[old_index] = new_name
 
@@ -934,6 +1156,33 @@ def rename_category_and_reassign(old_name: str, new_name: str) -> int:
         save_categories()
         save_apple_admins()
         return moved
+
+
+def move_category(name: str, direction: str) -> int:
+    """PC 웹 관리자 전용 카테고리 순서 변경.
+    auth_categories.json의 배열 순서를 변경해 서버에 즉시 저장합니다.
+    """
+    name = clean_category(name)
+    direction = (direction or "").strip().lower()
+
+    if name == "미지정":
+        raise HTTPException(status_code=400, detail="cannot_move_unspecified")
+    if direction not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="invalid_direction")
+
+    with _db_lock:
+        if name not in categories:
+            raise HTTPException(status_code=404, detail="category_not_found")
+
+        index = categories.index(name)
+        target = index - 1 if direction == "up" else index + 1
+        if target < 0 or target >= len(categories):
+            return index
+
+        categories[index], categories[target] = categories[target], categories[index]
+        save_categories()
+        return target
+
 
 
 def delete_category_and_reassign(name: str) -> int:
@@ -1429,7 +1678,7 @@ def apple_admin_upload_categories(request: Request):
     if allowed is None or str(allowed).strip() == "":
         return {"categories": [], "allowedCategory": None, "canAddCategory": False}
     if allowed == "전체":
-        return {"categories": ["미지정"] + sorted(categories, key=lambda x: x.lower()), "allowedCategory": "전체", "canAddCategory": True}
+        return {"categories": ["미지정"] + list(categories), "allowedCategory": "전체", "canAddCategory": True}
     return {"categories": [str(allowed)], "allowedCategory": str(allowed), "canAddCategory": False}
 
 
@@ -1602,7 +1851,7 @@ def android_admin_upload_categories(request: Request):
     allowed = profile.get("allowedCategory")
     if allowed == "전체":
         return {
-            "categories": ["미지정"] + sorted(categories, key=lambda x: x.lower()),
+            "categories": ["미지정"] + list(categories),
             "allowedCategory": "전체",
             "canAddCategory": True,
         }
@@ -1625,15 +1874,27 @@ def android_admin_add_upload_category(req: CategoryRequest, request: Request):
 
 @app.post("/android-admin/upload")
 def android_admin_upload(req: AppleAdminUploadRequest, request: Request):
-    _, profile = require_android_session(request)
+    source_code, profile = require_android_session(request)
     validate_phone(req.phoneLast4)
     category = validate_upload_category(profile, req.category)
-    # 기존 등록 순서 그대로: 등록 -> 승인 -> 삭제 비밀번호 -> 카테고리
-    register(RegisterRequest(name=req.name, phoneLast4=req.phoneLast4, code=req.code))
-    approve(CodeRequest(code=req.code))
-    set_delete_pwd(PasswordRequest(password=req.deletePassword, code=req.code))
-    set_category_for_code(req.code, category)
-    return {"status": "ok", "code": req.code, "category": category}
+    password = _effective_delete_password(req.deletePassword)
+
+    # 전체 권한은 기존 로직 그대로 즉시 서버 등록합니다.
+    if profile.get("allowedCategory") == "전체":
+        register(RegisterRequest(name=req.name, phoneLast4=req.phoneLast4, code=req.code))
+        approve(CodeRequest(code=req.code))
+        set_delete_pwd(PasswordRequest(password=password, code=req.code))
+        set_category_for_code(req.code, category)
+        return {"status": "ok", "code": req.code, "category": category}
+
+    # 특정 카테고리 권한은 실제 DB에 넣지 않고 iPhone/Android/PC 공용 승인목록으로 보냅니다.
+    item = create_approval_request(source_code, profile, req, category)
+    return {
+        "status": "pending_approval",
+        "requestId": item["requestId"],
+        "code": item["code"],
+        "category": item["category"],
+    }
 
 
 @app.post("/android-admin/manage-access")
@@ -1714,7 +1975,7 @@ def manage_list_secure(access: str):
 @app.get("/manage/categories")
 def manage_categories(admin: str):
     require_manager(admin)
-    return {"categories": ["미지정"] + sorted(categories, key=lambda x: x.lower())}
+    return {"categories": ["미지정"] + list(categories)}
 
 
 @app.post("/manage/categories")
@@ -1964,25 +2225,6 @@ async def web_categories(request: Request):
     return {"categories": ["미지정"] + list(categories)}
 
 
-@app.post("/admin/api/categories/order")
-async def web_categories_order(req: CategoryOrderRequest, request: Request):
-    require_web_login(request)
-    requested = []
-    for value in req.categories:
-        name = clean_category(value)
-        if name != "미지정" and name not in requested:
-            requested.append(name)
-
-    with _db_lock:
-        current = list(categories)
-        if set(requested) != set(current) or len(requested) != len(current):
-            raise HTTPException(status_code=400, detail="category_order_mismatch")
-        categories[:] = requested
-        save_categories()
-
-    return {"status": "ok", "categories": ["미지정"] + list(categories)}
-
-
 @app.post("/admin/api/categories")
 async def web_add_category(req: CategoryRequest, request: Request):
     require_web_login(request)
@@ -2012,6 +2254,13 @@ async def web_delete_category(req: CategoryRequest, request: Request):
     require_web_login(request)
     moved = delete_category_and_reassign(req.name)
     return {"status": "ok", "deletedCategory": req.name.strip(), "movedToUnspecified": moved}
+
+
+@app.post("/admin/api/categories/move")
+async def web_move_category(req: CategoryMoveRequest, request: Request):
+    require_web_login(request)
+    new_index = move_category(req.name, req.direction)
+    return {"status": "ok", "category": req.name.strip(), "index": new_index}
 
 
 @app.post("/admin/api/register")
@@ -2215,8 +2464,8 @@ async function addCategory(){let n=prompt('추가할 카테고리 이름');if(!n
 function openCategoryManager(){renderCategoryManager();categoryModal.classList.remove('hidden')}
 function closeCategoryManager(){categoryModal.classList.add('hidden')}
 function categoryCount(name){return items.filter(x=>(x.category||'미지정')===name).length}
-function renderCategoryManager(){let movable=categories.filter(c=>c!=='미지정');let names=['미지정',...movable];categoryManageList.innerHTML=names.map(n=>{let isDefault=n==='미지정';let idx=movable.indexOf(n);let arrows=isDefault?'':`<button onclick="moveCategory('${js(n)}',-1)" ${idx<=0?'disabled':''}>↑</button><button onclick="moveCategory('${js(n)}',1)" ${idx<0||idx>=movable.length-1?'disabled':''}>↓</button>`;return `<div class="item" style="cursor:default"><div class="row" style="justify-content:space-between;align-items:center"><div><b>${esc(n)}</b><div class="muted">인증키 ${categoryCount(n)}개</div></div><div class="row">${isDefault?'<span class="muted">기본 카테고리</span>':`${arrows}<button onclick="renameCategory('${js(n)}')">수정</button><button class="danger" onclick="deleteCategory('${js(n)}')">삭제</button>`}</div></div></div>`}).join('')}
-async function moveCategory(name,dir){let movable=categories.filter(c=>c!=='미지정');let i=movable.indexOf(name),j=i+dir;if(i<0||j<0||j>=movable.length)return;[movable[i],movable[j]]=[movable[j],movable[i]];try{let r=await api('/admin/api/categories/order',{method:'POST',body:JSON.stringify({categories:movable})});categories=r.categories||['미지정',...movable];fillCategories();renderTabs();renderCategoryManager()}catch(e){alert('카테고리 순서 저장 실패: '+e.message);await refresh();renderCategoryManager()}}
+function renderCategoryManager(){let movable=categories.filter(c=>c!=='미지정'),names=['미지정',...movable];categoryManageList.innerHTML=names.map(n=>{let isDefault=n==='미지정',idx=movable.indexOf(n),upDisabled=idx<=0,downDisabled=idx<0||idx>=movable.length-1;return `<div class="item" style="cursor:default"><div class="row" style="justify-content:space-between;align-items:center"><div><b>${esc(n)}</b><div class="muted">인증키 ${categoryCount(n)}개</div></div><div class="row">${isDefault?'<span class="muted">기본 카테고리</span>':`<button ${upDisabled?'disabled':''} onclick="moveCategory('${js(n)}','up')">↑</button><button ${downDisabled?'disabled':''} onclick="moveCategory('${js(n)}','down')">↓</button><button onclick="renameCategory('${js(n)}')">수정</button><button class="danger" onclick="deleteCategory('${js(n)}')">삭제</button>`}</div></div></div>`}).join('')}
+async function moveCategory(n,direction){if(!n||n==='미지정')return;try{await api('/admin/api/categories/move',{method:'POST',body:JSON.stringify({name:n,direction:direction})});await refresh();renderCategoryManager()}catch(e){alert('카테고리 순서 변경 실패: '+e.message)}}
 async function renameCategory(oldName){let n=prompt('새 카테고리 이름',oldName);if(n===null)return;n=n.trim();if(!n||n===oldName)return;try{let r=await api('/admin/api/categories/rename',{method:'POST',body:JSON.stringify({oldName:oldName,newName:n})});if(selectedCategory===oldName)selectedCategory=n;await refresh();renderCategoryManager();alert('카테고리 수정 완료\n인증키 '+(r.moved||0)+'개가 '+n+' 카테고리로 이동했습니다.')}catch(e){alert('카테고리 수정 실패: '+e.message)}}
 async function deleteCategory(n){if(!n||n==='미지정')return;if(!confirm('카테고리 '+n+' 을(를) 삭제할까요?\n안에 있는 인증키는 삭제되지 않고 미지정으로 이동합니다.'))return;try{let r=await api('/admin/api/categories/delete',{method:'POST',body:JSON.stringify({name:n})});if(selectedCategory===n)selectedCategory='전체';await refresh();renderCategoryManager();alert('카테고리 삭제 완료\n인증키 '+(r.movedToUnspecified||0)+'개가 미지정으로 이동했습니다.')}catch(e){alert('카테고리 삭제 실패: '+e.message)}}
 async function restoreBackupFile(input){let f=input.files&&input.files[0];if(!f)return;try{if(!confirm('선택한 백업 ZIP 내부 JSON 기준으로 전체 서버 내용을 복원할까요?\n현재 서버 내용은 백업 내용으로 교체됩니다.')){input.value='';return}let raw=await f.arrayBuffer();let r=await fetch('/admin/api/restore-backup',{method:'POST',headers:{'Content-Type':f.type||'application/octet-stream','X-Backup-Filename':f.name},body:raw});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));alert((data.type==='json'?'JSON':'ZIP')+' 복원 완료\n인증키 '+(data.records||0)+'개 / 카테고리 '+(data.categories||0)+'개');await refresh()}catch(e){alert('백업 복원 실패: '+e.message)}finally{input.value=''}}
