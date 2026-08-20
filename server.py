@@ -126,7 +126,10 @@ def load_categories():
             with open(CATEGORY_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             if isinstance(raw, list):
-                categories = [str(x).strip() for x in raw if str(x).strip() and str(x).strip() != "미지정"]
+                for value in raw:
+                    name = str(value).strip()
+                    if name and name != "미지정" and name not in categories:
+                        categories.append(name)
         except Exception:
             categories = []
 
@@ -136,7 +139,7 @@ def load_categories():
         if category and category != "미지정" and category not in categories:
             categories.append(category)
 
-    return sorted(set(categories), key=lambda x: x.lower())
+    return categories
 
 
 def save_data():
@@ -146,7 +149,11 @@ def save_data():
 
 def save_categories():
     with _db_lock:
-        cleaned = sorted({c.strip() for c in categories if c.strip() and c.strip() != "미지정"}, key=lambda x: x.lower())
+        cleaned = []
+        for value in categories:
+            name = str(value).strip()
+            if name and name != "미지정" and name not in cleaned:
+                cleaned.append(name)
         categories[:] = cleaned
         _atomic_json_save(CATEGORY_FILE, categories)
 
@@ -310,6 +317,10 @@ class CategoryRequest(BaseModel):
 class CategoryRenameRequest(BaseModel):
     oldName: str
     newName: str
+
+
+class CategoryOrderRequest(BaseModel):
+    categories: list[str]
 
 
 class CodeCategoryRequest(BaseModel):
@@ -909,10 +920,12 @@ def rename_category_and_reassign(old_name: str, new_name: str) -> int:
                 data["category"] = new_name
                 moved += 1
 
-        # 기존 카테고리는 제거하고, 새 이름이 없을 때만 추가합니다.
-        categories[:] = [c for c in categories if c != old_name]
-        if new_name not in categories:
-            categories.append(new_name)
+        # 이름만 수정할 때는 기존 카테고리 위치를 유지합니다.
+        old_index = categories.index(old_name)
+        if new_name in categories:
+            categories[:] = [c for c in categories if c != old_name]
+        else:
+            categories[old_index] = new_name
 
         for admin_record in apple_admins.values():
             if admin_record.get("allowedCategory") == old_name:
@@ -1948,7 +1961,26 @@ async def web_list(request: Request):
 @app.get("/admin/api/categories")
 async def web_categories(request: Request):
     require_web_login(request)
-    return {"categories": ["미지정"] + sorted(categories, key=lambda x: x.lower())}
+    return {"categories": ["미지정"] + list(categories)}
+
+
+@app.post("/admin/api/categories/order")
+async def web_categories_order(req: CategoryOrderRequest, request: Request):
+    require_web_login(request)
+    requested = []
+    for value in req.categories:
+        name = clean_category(value)
+        if name != "미지정" and name not in requested:
+            requested.append(name)
+
+    with _db_lock:
+        current = list(categories)
+        if set(requested) != set(current) or len(requested) != len(current):
+            raise HTTPException(status_code=400, detail="category_order_mismatch")
+        categories[:] = requested
+        save_categories()
+
+    return {"status": "ok", "categories": ["미지정"] + list(categories)}
 
 
 @app.post("/admin/api/categories")
@@ -2156,7 +2188,7 @@ label{display:block;font-size:13px;color:#aaa;margin:10px 0 5px}h1,h2,h3{margin-
 <div id="app" class="hidden">
 <div class="row" style="justify-content:space-between;align-items:center"><h1>코드노트 인증키</h1><div class="row"><button onclick="openBackupModal()">백업 / 복원</button><input id="restoreBackup" type="file" class="hidden" onchange="restoreBackupFile(this)"><button onclick="logout()">로그아웃</button></div></div>
 <div class="card"><h2>인증키 등록</h2><div class="row"><input id="rName" class="grow" placeholder="성함"><input id="rPhone" class="grow" inputmode="numeric" maxlength="4" placeholder="전화번호 끝 4자리"></div><div class="row" style="margin-top:10px"><select id="rCategory" class="grow"></select><button onclick="addCategory()">+ 카테고리 추가</button></div><div class="row" style="margin-top:10px"><input id="rCode" class="grow" placeholder="인증키"><input id="rPwd" class="grow" placeholder="삭제 비밀번호"></div><div class="row" style="margin-top:10px"><button class="primary" onclick="registerCode()">서버 업로드</button><button onclick="clearRegister()">입력값 지우기</button></div></div>
-<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button onclick="refresh()">새로고침</button><button onclick="addCategory()">카테고리 추가</button><button onclick="openCategoryManager()">카테고리 위치조정</button><button onclick="openApprovalManager()">승인목록</button><button onclick="openAppleAdminManager()">인증 등록 내역</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
+<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button onclick="refresh()">새로고침</button><button onclick="addCategory()">카테고리 추가</button><button onclick="openCategoryManager()">카테고리 관리</button><button onclick="openApprovalManager()">승인목록</button><button onclick="openAppleAdminManager()">인증 등록 내역</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
 </div></div>
 <div id="modal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between"><h2>인증키 상세</h2><button onclick="closeModal()">닫기</button></div><div id="detail"></div><div class="actions" id="detailActions"><button onclick="changeCategory()">카테고리</button><button onclick="activateSelected()">활성화</button><button onclick="deactivateSelected()">비활성화</button><button onclick="editSelected()">수정</button><button class="danger" onclick="deleteSelected()">삭제</button></div></div></div>
 <div id="editAuthModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 수정</h2><button onclick="closeEditAuthModal()">닫기</button></div><label>성함</label><input id="eName" style="width:100%"><label>전화번호 끝 4자리</label><input id="ePhone" style="width:100%" inputmode="numeric" maxlength="4"><label>인증키</label><input id="eCode" style="width:100%"><label>삭제 비밀번호</label><input id="ePwd" style="width:100%"><label>카테고리</label><select id="eCategory" style="width:100%"></select><div class="row" style="margin-top:16px"><button class="primary grow" onclick="saveEditSelected()">저장</button><button class="grow" onclick="closeEditAuthModal()">취소</button></div></div></div>
@@ -2183,7 +2215,8 @@ async function addCategory(){let n=prompt('추가할 카테고리 이름');if(!n
 function openCategoryManager(){renderCategoryManager();categoryModal.classList.remove('hidden')}
 function closeCategoryManager(){categoryModal.classList.add('hidden')}
 function categoryCount(name){return items.filter(x=>(x.category||'미지정')===name).length}
-function renderCategoryManager(){let names=['미지정',...categories.filter(c=>c!=='미지정')];categoryManageList.innerHTML=names.map(n=>{let isDefault=n==='미지정';return `<div class="item" style="cursor:default"><div class="row" style="justify-content:space-between;align-items:center"><div><b>${esc(n)}</b><div class="muted">인증키 ${categoryCount(n)}개</div></div><div class="row">${isDefault?'<span class="muted">기본 카테고리</span>':`<button onclick="renameCategory('${js(n)}')">수정</button><button class="danger" onclick="deleteCategory('${js(n)}')">삭제</button>`}</div></div></div>`}).join('')}
+function renderCategoryManager(){let movable=categories.filter(c=>c!=='미지정');let names=['미지정',...movable];categoryManageList.innerHTML=names.map(n=>{let isDefault=n==='미지정';let idx=movable.indexOf(n);let arrows=isDefault?'':`<button onclick="moveCategory('${js(n)}',-1)" ${idx<=0?'disabled':''}>↑</button><button onclick="moveCategory('${js(n)}',1)" ${idx<0||idx>=movable.length-1?'disabled':''}>↓</button>`;return `<div class="item" style="cursor:default"><div class="row" style="justify-content:space-between;align-items:center"><div><b>${esc(n)}</b><div class="muted">인증키 ${categoryCount(n)}개</div></div><div class="row">${isDefault?'<span class="muted">기본 카테고리</span>':`${arrows}<button onclick="renameCategory('${js(n)}')">수정</button><button class="danger" onclick="deleteCategory('${js(n)}')">삭제</button>`}</div></div></div>`}).join('')}
+async function moveCategory(name,dir){let movable=categories.filter(c=>c!=='미지정');let i=movable.indexOf(name),j=i+dir;if(i<0||j<0||j>=movable.length)return;[movable[i],movable[j]]=[movable[j],movable[i]];try{let r=await api('/admin/api/categories/order',{method:'POST',body:JSON.stringify({categories:movable})});categories=r.categories||['미지정',...movable];fillCategories();renderTabs();renderCategoryManager()}catch(e){alert('카테고리 순서 저장 실패: '+e.message);await refresh();renderCategoryManager()}}
 async function renameCategory(oldName){let n=prompt('새 카테고리 이름',oldName);if(n===null)return;n=n.trim();if(!n||n===oldName)return;try{let r=await api('/admin/api/categories/rename',{method:'POST',body:JSON.stringify({oldName:oldName,newName:n})});if(selectedCategory===oldName)selectedCategory=n;await refresh();renderCategoryManager();alert('카테고리 수정 완료\n인증키 '+(r.moved||0)+'개가 '+n+' 카테고리로 이동했습니다.')}catch(e){alert('카테고리 수정 실패: '+e.message)}}
 async function deleteCategory(n){if(!n||n==='미지정')return;if(!confirm('카테고리 '+n+' 을(를) 삭제할까요?\n안에 있는 인증키는 삭제되지 않고 미지정으로 이동합니다.'))return;try{let r=await api('/admin/api/categories/delete',{method:'POST',body:JSON.stringify({name:n})});if(selectedCategory===n)selectedCategory='전체';await refresh();renderCategoryManager();alert('카테고리 삭제 완료\n인증키 '+(r.movedToUnspecified||0)+'개가 미지정으로 이동했습니다.')}catch(e){alert('카테고리 삭제 실패: '+e.message)}}
 async function restoreBackupFile(input){let f=input.files&&input.files[0];if(!f)return;try{if(!confirm('선택한 백업 ZIP 내부 JSON 기준으로 전체 서버 내용을 복원할까요?\n현재 서버 내용은 백업 내용으로 교체됩니다.')){input.value='';return}let raw=await f.arrayBuffer();let r=await fetch('/admin/api/restore-backup',{method:'POST',headers:{'Content-Type':f.type||'application/octet-stream','X-Backup-Filename':f.name},body:raw});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));alert((data.type==='json'?'JSON':'ZIP')+' 복원 완료\n인증키 '+(data.records||0)+'개 / 카테고리 '+(data.categories||0)+'개');await refresh()}catch(e){alert('백업 복원 실패: '+e.message)}finally{input.value=''}}
