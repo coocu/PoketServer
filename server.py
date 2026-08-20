@@ -7,6 +7,9 @@ import shutil
 import threading
 import io
 import zipfile
+import base64
+import time
+import httpx
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -27,8 +30,16 @@ CATEGORY_FILE = os.environ.get("AUTH_CATEGORY_FILE", "auth_categories.json")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Kim86110!@")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "poket-admin-session-v1-change-me")
 APPLE_ADMIN_FILE = os.environ.get("APPLE_ADMIN_FILE", "apple_admins.json")
+APPROVAL_FILE = os.environ.get("AUTH_APPROVAL_FILE", str(Path(DATA_FILE).with_name("auth_approval_requests.json")))
 APPLE_CLIENT_ID = os.environ.get("APPLE_CLIENT_ID", "com.codenote.id")
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+
+# APNs 설정. 값이 없으면 승인 요청 자체는 정상 저장되고 푸시 전송만 건너뜁니다.
+APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "").strip()
+APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "").strip()
+APNS_BUNDLE_ID = os.environ.get("APNS_BUNDLE_ID", APPLE_CLIENT_ID).strip() or APPLE_CLIENT_ID
+APNS_PRIVATE_KEY = os.environ.get("APNS_PRIVATE_KEY", "")
+APNS_PRIVATE_KEY_BASE64 = os.environ.get("APNS_PRIVATE_KEY_BASE64", "").strip()
 DATA_FILE_EXISTED_AT_BOOT = os.path.exists(DATA_FILE)
 
 KST = ZoneInfo("Asia/Seoul")
@@ -145,6 +156,29 @@ def _normalize_apple_admin(record: dict) -> dict:
     record.setdefault("label", "")
     record.setdefault("registeredAt", now_kst().isoformat(timespec="seconds"))
     record.setdefault("allowedCategory", None)
+    tokens = record.get("pushTokens")
+    if not isinstance(tokens, list):
+        tokens = []
+    cleaned_tokens = []
+    seen = set()
+    for item in tokens:
+        if isinstance(item, str):
+            token = item.strip().lower()
+            environment = "production"
+            updated_at = ""
+        elif isinstance(item, dict):
+            token = str(item.get("token") or "").strip().lower()
+            environment = str(item.get("environment") or "production").strip().lower()
+            updated_at = str(item.get("updatedAt") or "")
+        else:
+            continue
+        if not token or token in seen:
+            continue
+        if environment not in ("sandbox", "production"):
+            environment = "production"
+        seen.add(token)
+        cleaned_tokens.append({"token": token, "environment": environment, "updatedAt": updated_at})
+    record["pushTokens"] = cleaned_tokens
     return record
 
 
@@ -171,9 +205,50 @@ def save_apple_admins():
         _atomic_json_save(APPLE_ADMIN_FILE, apple_admins)
 
 
+def _normalize_approval_request(record: dict) -> dict:
+    item = dict(record)
+    item.setdefault("requestId", "")
+    item.setdefault("requestedAt", now_kst().isoformat(timespec="seconds"))
+    item.setdefault("requesterUserId", "")
+    item.setdefault("requesterLabel", "")
+    item.setdefault("name", "")
+    item.setdefault("phoneLast4", "")
+    item.setdefault("code", "")
+    item.setdefault("deletePassword", "0000")
+    item.setdefault("category", "미지정")
+    item["category"] = clean_category(item.get("category")) if "clean_category" in globals() else (item.get("category") or "미지정")
+    return item
+
+
+def load_approval_requests():
+    if not os.path.exists(APPROVAL_FILE):
+        return {}
+    try:
+        with open(APPROVAL_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("auth_approval_requests.json must be a JSON object")
+        normalized = {}
+        for key, value in data.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                raise ValueError("invalid approval request")
+            item = _normalize_approval_request(value)
+            item["requestId"] = key
+            normalized[key] = item
+        return normalized
+    except Exception as exc:
+        raise RuntimeError(f"승인 대기 데이터 로드 실패: {exc}") from exc
+
+
+def save_approval_requests():
+    with _db_lock:
+        _atomic_json_save(APPROVAL_FILE, approval_requests)
+
+
 auth_db = load_data()
 categories = load_categories()
 apple_admins = load_apple_admins()
+approval_requests = load_approval_requests()
 
 
 def ensure_bootstrap_developer_key():
@@ -296,6 +371,15 @@ class AppleAdminUploadRequest(BaseModel):
     code: str
     deletePassword: str
     category: str = "미지정"
+
+
+class ApplePushTokenRequest(BaseModel):
+    deviceToken: str
+    environment: str = "production"
+
+
+class ApprovalActionRequest(BaseModel):
+    requestId: str
 
 
 # ============================================================
@@ -526,6 +610,200 @@ def validate_upload_category(profile: dict, requested: str) -> str:
     return str(allowed)
 
 
+def require_full_apple_admin(request: Request) -> tuple[str, dict]:
+    user_id, profile = require_apple_session(request)
+    if profile.get("allowedCategory") != "전체":
+        raise HTTPException(status_code=403, detail="full_permission_required")
+    return user_id, profile
+
+
+def _approval_items_sorted() -> list[dict]:
+    with _db_lock:
+        items = [dict(item) for item in approval_requests.values()]
+    items.sort(key=lambda x: x.get("requestedAt") or "", reverse=True)
+    return items
+
+
+def _effective_delete_password(value: Optional[str]) -> str:
+    value = (value or "").strip()
+    return value if value else "0000"
+
+
+def create_approval_request(user_id: str, profile: dict, req: AppleAdminUploadRequest, category: str) -> dict:
+    code = (req.code or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="code_required")
+    validate_phone(req.phoneLast4)
+    password = _effective_delete_password(req.deletePassword)
+
+    with _db_lock:
+        if code in auth_db:
+            raise HTTPException(status_code=409, detail="code_already_exists")
+        for item in approval_requests.values():
+            if str(item.get("code") or "").strip() == code:
+                raise HTTPException(status_code=409, detail="approval_request_already_exists")
+
+        request_id = secrets.token_hex(12)
+        item = {
+            "requestId": request_id,
+            "requestedAt": now_kst().isoformat(timespec="seconds"),
+            "requesterUserId": user_id,
+            "requesterLabel": str(profile.get("label") or ""),
+            "name": (req.name or "").strip(),
+            "phoneLast4": req.phoneLast4,
+            "code": code,
+            "deletePassword": password,
+            "category": category,
+        }
+        approval_requests[request_id] = item
+        save_approval_requests()
+
+    # 요청 저장이 성공한 뒤 푸시는 별도 스레드에서 전송합니다.
+    threading.Thread(target=send_approval_push_to_full_admins, args=(dict(item),), daemon=True).start()
+    return item
+
+
+def approve_pending_request(request_id: str) -> dict:
+    request_id = (request_id or "").strip()
+    with _db_lock:
+        item = approval_requests.get(request_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="approval_request_not_found")
+        item = dict(item)
+        if item.get("code") in auth_db:
+            raise HTTPException(status_code=409, detail="code_already_exists")
+
+    # 기존 서버 등록 순서를 그대로 재사용합니다.
+    register(RegisterRequest(name=item.get("name", ""), phoneLast4=item.get("phoneLast4", ""), code=item.get("code", "")))
+    approve(CodeRequest(code=item.get("code", "")))
+    set_delete_pwd(PasswordRequest(password=_effective_delete_password(item.get("deletePassword")), code=item.get("code", "")))
+    set_category_for_code(item.get("code", ""), clean_category(item.get("category")))
+
+    with _db_lock:
+        approval_requests.pop(request_id, None)
+        save_approval_requests()
+    return item
+
+
+def delete_pending_request(request_id: str) -> dict:
+    request_id = (request_id or "").strip()
+    with _db_lock:
+        item = approval_requests.pop(request_id, None)
+        if not item:
+            raise HTTPException(status_code=404, detail="approval_request_not_found")
+        save_approval_requests()
+        return dict(item)
+
+
+_apns_token_lock = threading.RLock()
+_apns_cached_provider_token: Optional[str] = None
+_apns_cached_provider_iat = 0
+
+
+def _apns_private_key_text() -> str:
+    if APNS_PRIVATE_KEY_BASE64:
+        try:
+            return base64.b64decode(APNS_PRIVATE_KEY_BASE64).decode("utf-8")
+        except Exception:
+            return ""
+    return APNS_PRIVATE_KEY.replace("\\n", "\n").strip()
+
+
+def _apns_provider_token() -> Optional[str]:
+    global _apns_cached_provider_token, _apns_cached_provider_iat
+    private_key = _apns_private_key_text()
+    if not APNS_KEY_ID or not APNS_TEAM_ID or not private_key:
+        return None
+    now = int(time.time())
+    with _apns_token_lock:
+        if _apns_cached_provider_token and now - _apns_cached_provider_iat < 50 * 60:
+            return _apns_cached_provider_token
+        token = jwt.encode(
+            {"iss": APNS_TEAM_ID, "iat": now},
+            private_key,
+            algorithm="ES256",
+            headers={"kid": APNS_KEY_ID},
+        )
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+        _apns_cached_provider_token = token
+        _apns_cached_provider_iat = now
+        return token
+
+
+def _remove_stale_push_token(device_token: str):
+    changed = False
+    with _db_lock:
+        for record in apple_admins.values():
+            _normalize_apple_admin(record)
+            before = len(record.get("pushTokens", []))
+            record["pushTokens"] = [x for x in record.get("pushTokens", []) if x.get("token") != device_token]
+            if len(record["pushTokens"]) != before:
+                changed = True
+        if changed:
+            save_apple_admins()
+
+
+def send_approval_push_to_full_admins(item: dict):
+    provider_token = _apns_provider_token()
+    if not provider_token:
+        return
+
+    targets = []
+    with _db_lock:
+        for record in apple_admins.values():
+            _normalize_apple_admin(record)
+            if record.get("allowedCategory") != "전체":
+                continue
+            for token_info in record.get("pushTokens", []):
+                token = str(token_info.get("token") or "").strip().lower()
+                env = str(token_info.get("environment") or "production").strip().lower()
+                if token:
+                    targets.append((token, "sandbox" if env == "sandbox" else "production"))
+
+    if not targets:
+        return
+
+    payload = {
+        "aps": {
+            "alert": {
+                "title": "인증키 승인 요청",
+                "body": f"{item.get('name','')} · {item.get('phoneLast4','')} · {item.get('category','미지정')}\n{item.get('code','')}",
+            },
+            "sound": "default",
+            "category": "AUTH_UPLOAD_APPROVAL",
+            "thread-id": "auth-upload-approval",
+        },
+        "approvalRequestId": item.get("requestId", ""),
+    }
+    headers = {
+        "authorization": f"bearer {provider_token}",
+        "apns-topic": APNS_BUNDLE_ID,
+        "apns-push-type": "alert",
+        "apns-priority": "10",
+        "content-type": "application/json",
+    }
+
+    try:
+        with httpx.Client(http2=True, timeout=10.0) as client:
+            for device_token, environment in targets:
+                host = "api.sandbox.push.apple.com" if environment == "sandbox" else "api.push.apple.com"
+                try:
+                    response = client.post(f"https://{host}/3/device/{device_token}", headers=headers, json=payload)
+                    if response.status_code in (400, 410):
+                        reason = ""
+                        try:
+                            reason = str(response.json().get("reason") or "")
+                        except Exception:
+                            pass
+                        if response.status_code == 410 or reason in ("BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"):
+                            _remove_stale_push_token(device_token)
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
 @app.middleware("http")
 async def enforce_registered_apple_admin_for_iphone_requests(request: Request, call_next):
     # 기존 앱은 이 헤더를 보내지 않으므로 기존 API 동작은 그대로 유지됩니다.
@@ -681,6 +959,7 @@ def build_full_backup_zip() -> bytes:
         auth_snapshot = {code: dict(data) for code, data in auth_db.items()}
         category_snapshot = list(categories)
         apple_admin_snapshot = {user_id: dict(data) for user_id, data in apple_admins.items()}
+        approval_snapshot = {request_id: dict(data) for request_id, data in approval_requests.items()}
 
     manifest = {
         "format": "codenote-auth-backup",
@@ -689,6 +968,7 @@ def build_full_backup_zip() -> bytes:
         "records": len(auth_snapshot),
         "categories": len(category_snapshot),
         "appleAdmins": len(apple_admin_snapshot),
+        "approvalRequests": len(approval_snapshot),
     }
 
     out = io.BytesIO()
@@ -697,6 +977,7 @@ def build_full_backup_zip() -> bytes:
         zf.writestr("auth_data.json", json.dumps(auth_snapshot, ensure_ascii=False, indent=2))
         zf.writestr("auth_categories.json", json.dumps(category_snapshot, ensure_ascii=False, indent=2))
         zf.writestr("apple_admins.json", json.dumps(apple_admin_snapshot, ensure_ascii=False, indent=2))
+        zf.writestr("auth_approval_requests.json", json.dumps(approval_snapshot, ensure_ascii=False, indent=2))
     return out.getvalue()
 
 
@@ -721,6 +1002,10 @@ def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
             incoming_apple_admins = (
                 json.loads(zf.read(members["apple_admins.json"]).decode("utf-8-sig"))
                 if "apple_admins.json" in members else None
+            )
+            incoming_approval_requests = (
+                json.loads(zf.read(members["auth_approval_requests.json"]).decode("utf-8-sig"))
+                if "auth_approval_requests.json" in members else None
             )
     except HTTPException:
         raise
@@ -765,6 +1050,18 @@ def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
                 raise HTTPException(status_code=400, detail="invalid_apple_admin_record")
             normalized_apple_admins[user_id] = _normalize_apple_admin(dict(record))
 
+    normalized_approval_requests = None
+    if incoming_approval_requests is not None:
+        if not isinstance(incoming_approval_requests, dict):
+            raise HTTPException(status_code=400, detail="invalid_approval_requests")
+        normalized_approval_requests = {}
+        for request_id, record in incoming_approval_requests.items():
+            if not isinstance(request_id, str) or not request_id.strip() or not isinstance(record, dict):
+                raise HTTPException(status_code=400, detail="invalid_approval_request")
+            item = _normalize_approval_request(record)
+            item["requestId"] = request_id
+            normalized_approval_requests[request_id] = item
+
     with _db_lock:
         auth_db.clear()
         auth_db.update(normalized_db)
@@ -772,11 +1069,16 @@ def restore_full_backup_zip(raw: bytes) -> tuple[int, int]:
         if normalized_apple_admins is not None:
             apple_admins.clear()
             apple_admins.update(normalized_apple_admins)
+        if normalized_approval_requests is not None:
+            approval_requests.clear()
+            approval_requests.update(normalized_approval_requests)
         # _atomic_json_save가 현재 서버 파일을 .bak로 남긴 뒤 교체합니다.
         save_data()
         save_categories()
         if normalized_apple_admins is not None:
             save_apple_admins()
+        if normalized_approval_requests is not None:
+            save_approval_requests()
 
     return len(normalized_db), len(normalized_categories)
 
@@ -1134,15 +1436,71 @@ def apple_admin_add_upload_category(req: CategoryRequest, request: Request):
 
 @app.post("/apple-admin/upload")
 def apple_admin_upload(req: AppleAdminUploadRequest, request: Request):
-    _, profile = require_apple_session(request)
+    user_id, profile = require_apple_session(request)
     validate_phone(req.phoneLast4)
     category = validate_upload_category(profile, req.category)
-    # 기존 서버 등록 순서를 그대로 실행합니다.
-    register(RegisterRequest(name=req.name, phoneLast4=req.phoneLast4, code=req.code))
-    approve(CodeRequest(code=req.code))
-    set_delete_pwd(PasswordRequest(password=req.deletePassword, code=req.code))
-    set_category_for_code(req.code, category)
-    return {"status": "ok", "code": req.code, "category": category}
+    password = _effective_delete_password(req.deletePassword)
+
+    # 전체 권한은 기존과 동일하게 즉시 등록합니다.
+    if profile.get("allowedCategory") == "전체":
+        register(RegisterRequest(name=req.name, phoneLast4=req.phoneLast4, code=req.code))
+        approve(CodeRequest(code=req.code))
+        set_delete_pwd(PasswordRequest(password=password, code=req.code))
+        set_category_for_code(req.code, category)
+        return {"status": "ok", "code": req.code, "category": category}
+
+    # 특정 카테고리 권한 사용자는 실제 인증키 DB에 넣지 않고 승인 대기 목록에만 저장합니다.
+    item = create_approval_request(user_id, profile, req, category)
+    return {
+        "status": "pending_approval",
+        "requestId": item["requestId"],
+        "code": item["code"],
+        "category": item["category"],
+    }
+
+
+@app.post("/apple-admin/push-token")
+def apple_admin_push_token(req: ApplePushTokenRequest, request: Request):
+    user_id, _ = require_apple_session(request)
+    token = (req.deviceToken or "").strip().lower()
+    environment = (req.environment or "production").strip().lower()
+    if environment not in ("sandbox", "production"):
+        environment = "production"
+    if not token or any(ch not in "0123456789abcdef" for ch in token):
+        raise HTTPException(status_code=400, detail="invalid_device_token")
+    with _db_lock:
+        record = apple_admins.get(user_id)
+        if not record:
+            raise HTTPException(status_code=401, detail="apple_admin_not_registered")
+        _normalize_apple_admin(record)
+        record["pushTokens"] = [x for x in record.get("pushTokens", []) if x.get("token") != token]
+        record["pushTokens"].append({
+            "token": token,
+            "environment": environment,
+            "updatedAt": now_kst().isoformat(timespec="seconds"),
+        })
+        save_apple_admins()
+    return {"status": "ok"}
+
+
+@app.get("/apple-admin/approval-requests")
+def apple_admin_approval_requests(request: Request):
+    require_full_apple_admin(request)
+    return {"items": _approval_items_sorted()}
+
+
+@app.post("/apple-admin/approval-requests/approve")
+def apple_admin_approval_approve(req: ApprovalActionRequest, request: Request):
+    require_full_apple_admin(request)
+    item = approve_pending_request(req.requestId)
+    return {"status": "ok", "code": item.get("code", "")}
+
+
+@app.post("/apple-admin/approval-requests/delete")
+def apple_admin_approval_delete(req: ApprovalActionRequest, request: Request):
+    require_full_apple_admin(request)
+    item = delete_pending_request(req.requestId)
+    return {"status": "ok", "code": item.get("code", "")}
 
 
 @app.post("/apple-admin/manage-access")
@@ -1712,6 +2070,26 @@ async def web_apple_admin_delete(req: AppleAdminDeleteRequest, request: Request)
     return {"status": "ok"}
 
 
+@app.get("/admin/api/approval-requests")
+async def web_approval_requests(request: Request):
+    require_web_login(request)
+    return {"items": _approval_items_sorted()}
+
+
+@app.post("/admin/api/approval-requests/approve")
+async def web_approval_approve(req: ApprovalActionRequest, request: Request):
+    require_web_login(request)
+    item = approve_pending_request(req.requestId)
+    return {"status": "ok", "code": item.get("code", "")}
+
+
+@app.post("/admin/api/approval-requests/delete")
+async def web_approval_delete(req: ApprovalActionRequest, request: Request):
+    require_web_login(request)
+    item = delete_pending_request(req.requestId)
+    return {"status": "ok", "code": item.get("code", "")}
+
+
 @app.get("/admin/api/export-json")
 async def web_export_json(request: Request):
     # 기존 직접 호출 호환을 위해 경로는 유지하지만 PC UI에서는 ZIP 백업을 사용합니다.
@@ -1721,6 +2099,7 @@ async def web_export_json(request: Request):
         "auth_db": auth_db,
         "categories": categories,
         "apple_admins": apple_admins,
+        "approval_requests": approval_requests,
     }
     return JSONResponse(
         payload,
@@ -1777,13 +2156,14 @@ label{display:block;font-size:13px;color:#aaa;margin:10px 0 5px}h1,h2,h3{margin-
 <div id="app" class="hidden">
 <div class="row" style="justify-content:space-between;align-items:center"><h1>코드노트 인증키</h1><div class="row"><button onclick="openBackupModal()">백업 / 복원</button><input id="restoreBackup" type="file" class="hidden" onchange="restoreBackupFile(this)"><button onclick="logout()">로그아웃</button></div></div>
 <div class="card"><h2>인증키 등록</h2><div class="row"><input id="rName" class="grow" placeholder="성함"><input id="rPhone" class="grow" inputmode="numeric" maxlength="4" placeholder="전화번호 끝 4자리"></div><div class="row" style="margin-top:10px"><select id="rCategory" class="grow"></select><button onclick="addCategory()">+ 카테고리 추가</button></div><div class="row" style="margin-top:10px"><input id="rCode" class="grow" placeholder="인증키"><input id="rPwd" class="grow" placeholder="삭제 비밀번호"></div><div class="row" style="margin-top:10px"><button class="primary" onclick="registerCode()">서버 업로드</button><button onclick="clearRegister()">입력값 지우기</button></div></div>
-<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button onclick="openCategoryManager()">카테고리 관리</button><button onclick="openAppleAdminManager()">인증 등록 내역</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
+<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button onclick="refresh()">새로고침</button><button onclick="addCategory()">카테고리 추가</button><button onclick="openCategoryManager()">카테고리 위치조정</button><button onclick="openApprovalManager()">승인목록</button><button onclick="openAppleAdminManager()">인증 등록 내역</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
 </div></div>
 <div id="modal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between"><h2>인증키 상세</h2><button onclick="closeModal()">닫기</button></div><div id="detail"></div><div class="actions" id="detailActions"><button onclick="changeCategory()">카테고리</button><button onclick="activateSelected()">활성화</button><button onclick="deactivateSelected()">비활성화</button><button onclick="editSelected()">수정</button><button class="danger" onclick="deleteSelected()">삭제</button></div></div></div>
 <div id="editAuthModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 수정</h2><button onclick="closeEditAuthModal()">닫기</button></div><label>성함</label><input id="eName" style="width:100%"><label>전화번호 끝 4자리</label><input id="ePhone" style="width:100%" inputmode="numeric" maxlength="4"><label>인증키</label><input id="eCode" style="width:100%"><label>삭제 비밀번호</label><input id="ePwd" style="width:100%"><label>카테고리</label><select id="eCategory" style="width:100%"></select><div class="row" style="margin-top:16px"><button class="primary grow" onclick="saveEditSelected()">저장</button><button class="grow" onclick="closeEditAuthModal()">취소</button></div></div></div>
 <div id="categoryModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>카테고리 관리</h2><button onclick="closeCategoryManager()">닫기</button></div><div id="categoryManageList" class="list"></div><p class="muted" style="margin:14px 0 0">카테고리를 삭제하면 인증키는 삭제되지 않고 미지정으로 이동합니다.</p></div></div>
 <div id="backupModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>백업 / 복원</h2><button onclick="closeBackupModal()">닫기</button></div><div class="row"><button class="primary grow" onclick="location.href='/admin/api/backup-zip'">ZIP 백업</button><button class="grow" onclick="document.getElementById('restoreBackup').click()">ZIP 복원</button></div></div></div>
 <div id="appleAdminModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증 등록 내역</h2><button onclick="closeAppleAdminManager()">닫기</button></div><div id="appleAdminList" class="list"></div></div></div>
+<div id="approvalModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>승인목록</h2><div class="row"><button onclick="openApprovalManager()">새로고침</button><button onclick="closeApprovalManager()">닫기</button></div></div><div id="approvalList" class="list"></div></div></div>
 <script>
 let items=[], categories=['미지정'], selectedCategory='전체', selected=null;
 async function api(path,opt={}){let r=await fetch(path,{headers:{'Content-Type':'application/json',...(opt.headers||{})},...opt});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));return data}
@@ -1825,6 +2205,11 @@ function closeAppleAdminManager(){appleAdminModal.classList.add('hidden')}
 function renderAppleAdminManager(a){appleAdminList.innerHTML=a.length?a.map(x=>`<div class="item" style="cursor:default"><div class="itemtop"><b>${esc(x.label||'')}</b><span class="badge">${esc(x.allowedCategory||'권한 미설정')}</span></div><div class="muted">${esc(x.registeredAt||'')}</div><div class="code">${esc(x.userId||'')}</div><div class="row" style="margin-top:10px"><button onclick="editAppleAdmin('${js(x.userId)}','${js(x.label||'')}','${js(x.allowedCategory||'') }')">수정</button><button class="danger" onclick="deleteAppleAdmin('${js(x.userId)}')">삭제</button></div></div>`).join(''):'<p class="muted">등록된 Apple 관리자가 없습니다.</p>'}
 async function editAppleAdmin(userId,label,currentCategory){let newLabel=prompt('등록 문구',label);if(newLabel===null)return;newLabel=newLabel.trim();if(!newLabel)return alert('등록 문구를 입력하세요.');let guide='허용 카테고리 입력\n전체 또는 카테고리 이름\n비워두면 권한 미설정\n\n현재 카테고리: '+categories.join(', ');let allowed=prompt(guide,currentCategory||'');if(allowed===null)return;allowed=allowed.trim();let payload={userId:userId,label:newLabel,allowedCategory:allowed||null};try{await api('/admin/api/apple-admins/update',{method:'POST',body:JSON.stringify(payload)});await openAppleAdminManager();alert('수정 완료')}catch(e){alert('수정 실패: '+e.message)}}
 async function deleteAppleAdmin(userId){if(!confirm('이 관리자 등록을 삭제할까요?\n해당 계정은 다음 요청부터 앱을 사용할 수 없습니다.'))return;try{await api('/admin/api/apple-admins/delete',{method:'POST',body:JSON.stringify({userId:userId})});await openAppleAdminManager();alert('삭제 완료')}catch(e){alert('삭제 실패: '+e.message)}}
+async function openApprovalManager(){try{let r=await api('/admin/api/approval-requests');renderApprovalManager(r.items||[]);approvalModal.classList.remove('hidden')}catch(e){alert('승인목록 불러오기 실패: '+e.message)}}
+function closeApprovalManager(){approvalModal.classList.add('hidden')}
+function renderApprovalManager(a){approvalList.innerHTML=a.length?a.map(x=>`<div class="item" style="cursor:default"><div class="itemtop"><b>${esc(x.name||'')}</b><span class="badge">${esc(x.category||'미지정')}</span></div><div class="muted">요청자: ${esc(x.requesterLabel||'')} · ${esc(x.requestedAt||'')}</div><div class="muted">전화번호: ${esc(x.phoneLast4||'')}</div><div class="code">${esc(x.code||'')}</div><div class="muted">삭제 비밀번호: ${esc(x.deletePassword||'0000')}</div><div class="row" style="margin-top:10px"><button class="primary grow" onclick="approvePending('${js(x.requestId)}')">승인</button><button class="danger grow" onclick="deletePending('${js(x.requestId)}')">삭제</button></div></div>`).join(''):'<p class="muted">승인 대기 요청이 없습니다.</p>'}
+async function approvePending(id){if(!confirm('이 인증키 등록 요청을 승인할까요?'))return;try{await api('/admin/api/approval-requests/approve',{method:'POST',body:JSON.stringify({requestId:id})});await Promise.all([refresh(),openApprovalManager()]);alert('승인 완료')}catch(e){alert('승인 실패: '+e.message)}}
+async function deletePending(id){if(!confirm('이 승인 요청을 삭제할까요?'))return;try{await api('/admin/api/approval-requests/delete',{method:'POST',body:JSON.stringify({requestId:id})});await openApprovalManager();alert('삭제 완료')}catch(e){alert('삭제 실패: '+e.message)}}
 boot();
 </script></body></html>'''
 
