@@ -144,16 +144,7 @@ def load_categories():
         if category and category != "미지정" and category not in categories:
             categories.append(category)
 
-    # auth_categories.json에 저장된 순서를 그대로 유지합니다.
-    # set/sorted를 사용하면 관리자가 지정한 카테고리 순서가 사라지므로
-    # 중복만 제거하고 최초 등장 순서를 보존합니다.
-    cleaned = []
-    seen = set()
-    for category in categories:
-        if category not in seen:
-            seen.add(category)
-            cleaned.append(category)
-    return cleaned
+    return sorted(set(categories), key=lambda x: x.lower())
 
 
 def save_data():
@@ -163,15 +154,7 @@ def save_data():
 
 def save_categories():
     with _db_lock:
-        # 관리자에서 지정한 순서를 그대로 저장합니다.
-        cleaned = []
-        seen = set()
-        for value in categories:
-            name = str(value).strip()
-            if not name or name == "미지정" or name in seen:
-                continue
-            seen.add(name)
-            cleaned.append(name)
+        cleaned = sorted({c.strip() for c in categories if c.strip() and c.strip() != "미지정"}, key=lambda x: x.lower())
         categories[:] = cleaned
         _atomic_json_save(CATEGORY_FILE, categories)
 
@@ -335,11 +318,6 @@ class CategoryRequest(BaseModel):
 class CategoryRenameRequest(BaseModel):
     oldName: str
     newName: str
-
-
-class CategoryMoveRequest(BaseModel):
-    name: str
-    direction: str
 
 
 class CodeCategoryRequest(BaseModel):
@@ -782,6 +760,7 @@ def _remove_stale_push_token(device_token: str):
 def send_approval_push_to_full_admins(item: dict):
     provider_token = _apns_provider_token()
     if not provider_token:
+        print("[APNS] provider token unavailable: check APNS_KEY_ID / APNS_TEAM_ID / APNS_PRIVATE_KEY(_BASE64)", flush=True)
         return
 
     targets = []
@@ -797,7 +776,12 @@ def send_approval_push_to_full_admins(item: dict):
                     targets.append((token, "sandbox" if env == "sandbox" else "production"))
 
     if not targets:
+        print("[APNS] no full-admin push targets registered", flush=True)
         return
+
+    sandbox_count = sum(1 for _, env in targets if env == "sandbox")
+    production_count = sum(1 for _, env in targets if env == "production")
+    print(f"[APNS] sending approval push: targets={len(targets)} sandbox={sandbox_count} production={production_count}", flush=True)
 
     payload = {
         "aps": {
@@ -825,17 +809,21 @@ def send_approval_push_to_full_admins(item: dict):
                 host = "api.sandbox.push.apple.com" if environment == "sandbox" else "api.push.apple.com"
                 try:
                     response = client.post(f"https://{host}/3/device/{device_token}", headers=headers, json=payload)
+                    reason = ""
+                    try:
+                        reason = str(response.json().get("reason") or "")
+                    except Exception:
+                        pass
+                    masked = f"{device_token[:6]}...{device_token[-6:]}" if len(device_token) >= 12 else "***"
+                    print(f"[APNS] env={environment} token={masked} status={response.status_code} reason={reason or '-'}", flush=True)
                     if response.status_code in (400, 410):
-                        reason = ""
-                        try:
-                            reason = str(response.json().get("reason") or "")
-                        except Exception:
-                            pass
                         if response.status_code == 410 or reason in ("BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"):
                             _remove_stale_push_token(device_token)
-                except Exception:
+                except Exception as exc:
+                    print(f"[APNS] send exception env={environment}: {type(exc).__name__}: {exc}", flush=True)
                     continue
-    except Exception:
+    except Exception as exc:
+        print(f"[APNS] client exception: {type(exc).__name__}: {exc}", flush=True)
         return
 
 
@@ -1141,13 +1129,10 @@ def rename_category_and_reassign(old_name: str, new_name: str) -> int:
                 data["category"] = new_name
                 moved += 1
 
-        # 이름만 바꿀 때는 현재 카테고리 위치를 그대로 유지합니다.
-        # 이미 존재하는 이름으로 변경하는 경우에는 기존 카테고리로 병합합니다.
-        old_index = categories.index(old_name)
-        if new_name in categories:
-            categories.pop(old_index)
-        else:
-            categories[old_index] = new_name
+        # 기존 카테고리는 제거하고, 새 이름이 없을 때만 추가합니다.
+        categories[:] = [c for c in categories if c != old_name]
+        if new_name not in categories:
+            categories.append(new_name)
 
         for admin_record in apple_admins.values():
             if admin_record.get("allowedCategory") == old_name:
@@ -1156,33 +1141,6 @@ def rename_category_and_reassign(old_name: str, new_name: str) -> int:
         save_categories()
         save_apple_admins()
         return moved
-
-
-def move_category(name: str, direction: str) -> int:
-    """PC 웹 관리자 전용 카테고리 순서 변경.
-    auth_categories.json의 배열 순서를 변경해 서버에 즉시 저장합니다.
-    """
-    name = clean_category(name)
-    direction = (direction or "").strip().lower()
-
-    if name == "미지정":
-        raise HTTPException(status_code=400, detail="cannot_move_unspecified")
-    if direction not in ("up", "down"):
-        raise HTTPException(status_code=400, detail="invalid_direction")
-
-    with _db_lock:
-        if name not in categories:
-            raise HTTPException(status_code=404, detail="category_not_found")
-
-        index = categories.index(name)
-        target = index - 1 if direction == "up" else index + 1
-        if target < 0 or target >= len(categories):
-            return index
-
-        categories[index], categories[target] = categories[target], categories[index]
-        save_categories()
-        return target
-
 
 
 def delete_category_and_reassign(name: str) -> int:
@@ -1678,7 +1636,7 @@ def apple_admin_upload_categories(request: Request):
     if allowed is None or str(allowed).strip() == "":
         return {"categories": [], "allowedCategory": None, "canAddCategory": False}
     if allowed == "전체":
-        return {"categories": ["미지정"] + list(categories), "allowedCategory": "전체", "canAddCategory": True}
+        return {"categories": ["미지정"] + sorted(categories, key=lambda x: x.lower()), "allowedCategory": "전체", "canAddCategory": True}
     return {"categories": [str(allowed)], "allowedCategory": str(allowed), "canAddCategory": False}
 
 
@@ -1742,6 +1700,8 @@ def apple_admin_push_token(req: ApplePushTokenRequest, request: Request):
             "updatedAt": now_kst().isoformat(timespec="seconds"),
         })
         save_apple_admins()
+    masked = f"{token[:6]}...{token[-6:]}" if len(token) >= 12 else "***"
+    print(f"[APNS] device token registered user={user_id[:10]}... env={environment} token={masked}", flush=True)
     return {"status": "ok"}
 
 
@@ -1851,7 +1811,7 @@ def android_admin_upload_categories(request: Request):
     allowed = profile.get("allowedCategory")
     if allowed == "전체":
         return {
-            "categories": ["미지정"] + list(categories),
+            "categories": ["미지정"] + sorted(categories, key=lambda x: x.lower()),
             "allowedCategory": "전체",
             "canAddCategory": True,
         }
@@ -1975,7 +1935,7 @@ def manage_list_secure(access: str):
 @app.get("/manage/categories")
 def manage_categories(admin: str):
     require_manager(admin)
-    return {"categories": ["미지정"] + list(categories)}
+    return {"categories": ["미지정"] + sorted(categories, key=lambda x: x.lower())}
 
 
 @app.post("/manage/categories")
@@ -2222,7 +2182,7 @@ async def web_list(request: Request):
 @app.get("/admin/api/categories")
 async def web_categories(request: Request):
     require_web_login(request)
-    return {"categories": ["미지정"] + list(categories)}
+    return {"categories": ["미지정"] + sorted(categories, key=lambda x: x.lower())}
 
 
 @app.post("/admin/api/categories")
@@ -2254,13 +2214,6 @@ async def web_delete_category(req: CategoryRequest, request: Request):
     require_web_login(request)
     moved = delete_category_and_reassign(req.name)
     return {"status": "ok", "deletedCategory": req.name.strip(), "movedToUnspecified": moved}
-
-
-@app.post("/admin/api/categories/move")
-async def web_move_category(req: CategoryMoveRequest, request: Request):
-    require_web_login(request)
-    new_index = move_category(req.name, req.direction)
-    return {"status": "ok", "category": req.name.strip(), "index": new_index}
 
 
 @app.post("/admin/api/register")
@@ -2437,7 +2390,7 @@ label{display:block;font-size:13px;color:#aaa;margin:10px 0 5px}h1,h2,h3{margin-
 <div id="app" class="hidden">
 <div class="row" style="justify-content:space-between;align-items:center"><h1>코드노트 인증키</h1><div class="row"><button onclick="openBackupModal()">백업 / 복원</button><input id="restoreBackup" type="file" class="hidden" onchange="restoreBackupFile(this)"><button onclick="logout()">로그아웃</button></div></div>
 <div class="card"><h2>인증키 등록</h2><div class="row"><input id="rName" class="grow" placeholder="성함"><input id="rPhone" class="grow" inputmode="numeric" maxlength="4" placeholder="전화번호 끝 4자리"></div><div class="row" style="margin-top:10px"><select id="rCategory" class="grow"></select><button onclick="addCategory()">+ 카테고리 추가</button></div><div class="row" style="margin-top:10px"><input id="rCode" class="grow" placeholder="인증키"><input id="rPwd" class="grow" placeholder="삭제 비밀번호"></div><div class="row" style="margin-top:10px"><button class="primary" onclick="registerCode()">서버 업로드</button><button onclick="clearRegister()">입력값 지우기</button></div></div>
-<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button onclick="refresh()">새로고침</button><button onclick="addCategory()">카테고리 추가</button><button onclick="openCategoryManager()">카테고리 관리</button><button onclick="openApprovalManager()">승인목록</button><button onclick="openAppleAdminManager()">인증 등록 내역</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
+<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 목록</h2><div class="row"><button onclick="refresh()">새로고침</button><button onclick="addCategory()">카테고리 추가</button><button onclick="openCategoryManager()">카테고리 위치조정</button><button onclick="openApprovalManager()">승인목록</button><button onclick="openAppleAdminManager()">인증 등록 내역</button></div></div><div id="tabs" class="tabs"></div><input id="search" style="width:100%;margin:8px 0 12px" placeholder="🔍 이름 / 전화번호 / 인증키 검색" oninput="renderList()"><div id="list" class="list"></div></div>
 </div></div>
 <div id="modal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between"><h2>인증키 상세</h2><button onclick="closeModal()">닫기</button></div><div id="detail"></div><div class="actions" id="detailActions"><button onclick="changeCategory()">카테고리</button><button onclick="activateSelected()">활성화</button><button onclick="deactivateSelected()">비활성화</button><button onclick="editSelected()">수정</button><button class="danger" onclick="deleteSelected()">삭제</button></div></div></div>
 <div id="editAuthModal" class="modal hidden"><div class="modalbox"><div class="row" style="justify-content:space-between;align-items:center"><h2>인증키 수정</h2><button onclick="closeEditAuthModal()">닫기</button></div><label>성함</label><input id="eName" style="width:100%"><label>전화번호 끝 4자리</label><input id="ePhone" style="width:100%" inputmode="numeric" maxlength="4"><label>인증키</label><input id="eCode" style="width:100%"><label>삭제 비밀번호</label><input id="ePwd" style="width:100%"><label>카테고리</label><select id="eCategory" style="width:100%"></select><div class="row" style="margin-top:16px"><button class="primary grow" onclick="saveEditSelected()">저장</button><button class="grow" onclick="closeEditAuthModal()">취소</button></div></div></div>
@@ -2464,8 +2417,7 @@ async function addCategory(){let n=prompt('추가할 카테고리 이름');if(!n
 function openCategoryManager(){renderCategoryManager();categoryModal.classList.remove('hidden')}
 function closeCategoryManager(){categoryModal.classList.add('hidden')}
 function categoryCount(name){return items.filter(x=>(x.category||'미지정')===name).length}
-function renderCategoryManager(){let movable=categories.filter(c=>c!=='미지정'),names=['미지정',...movable];categoryManageList.innerHTML=names.map(n=>{let isDefault=n==='미지정',idx=movable.indexOf(n),upDisabled=idx<=0,downDisabled=idx<0||idx>=movable.length-1;return `<div class="item" style="cursor:default"><div class="row" style="justify-content:space-between;align-items:center"><div><b>${esc(n)}</b><div class="muted">인증키 ${categoryCount(n)}개</div></div><div class="row">${isDefault?'<span class="muted">기본 카테고리</span>':`<button ${upDisabled?'disabled':''} onclick="moveCategory('${js(n)}','up')">↑</button><button ${downDisabled?'disabled':''} onclick="moveCategory('${js(n)}','down')">↓</button><button onclick="renameCategory('${js(n)}')">수정</button><button class="danger" onclick="deleteCategory('${js(n)}')">삭제</button>`}</div></div></div>`}).join('')}
-async function moveCategory(n,direction){if(!n||n==='미지정')return;try{await api('/admin/api/categories/move',{method:'POST',body:JSON.stringify({name:n,direction:direction})});await refresh();renderCategoryManager()}catch(e){alert('카테고리 순서 변경 실패: '+e.message)}}
+function renderCategoryManager(){let names=['미지정',...categories.filter(c=>c!=='미지정')];categoryManageList.innerHTML=names.map(n=>{let isDefault=n==='미지정';return `<div class="item" style="cursor:default"><div class="row" style="justify-content:space-between;align-items:center"><div><b>${esc(n)}</b><div class="muted">인증키 ${categoryCount(n)}개</div></div><div class="row">${isDefault?'<span class="muted">기본 카테고리</span>':`<button onclick="renameCategory('${js(n)}')">수정</button><button class="danger" onclick="deleteCategory('${js(n)}')">삭제</button>`}</div></div></div>`}).join('')}
 async function renameCategory(oldName){let n=prompt('새 카테고리 이름',oldName);if(n===null)return;n=n.trim();if(!n||n===oldName)return;try{let r=await api('/admin/api/categories/rename',{method:'POST',body:JSON.stringify({oldName:oldName,newName:n})});if(selectedCategory===oldName)selectedCategory=n;await refresh();renderCategoryManager();alert('카테고리 수정 완료\n인증키 '+(r.moved||0)+'개가 '+n+' 카테고리로 이동했습니다.')}catch(e){alert('카테고리 수정 실패: '+e.message)}}
 async function deleteCategory(n){if(!n||n==='미지정')return;if(!confirm('카테고리 '+n+' 을(를) 삭제할까요?\n안에 있는 인증키는 삭제되지 않고 미지정으로 이동합니다.'))return;try{let r=await api('/admin/api/categories/delete',{method:'POST',body:JSON.stringify({name:n})});if(selectedCategory===n)selectedCategory='전체';await refresh();renderCategoryManager();alert('카테고리 삭제 완료\n인증키 '+(r.movedToUnspecified||0)+'개가 미지정으로 이동했습니다.')}catch(e){alert('카테고리 삭제 실패: '+e.message)}}
 async function restoreBackupFile(input){let f=input.files&&input.files[0];if(!f)return;try{if(!confirm('선택한 백업 ZIP 내부 JSON 기준으로 전체 서버 내용을 복원할까요?\n현재 서버 내용은 백업 내용으로 교체됩니다.')){input.value='';return}let raw=await f.arrayBuffer();let r=await fetch('/admin/api/restore-backup',{method:'POST',headers:{'Content-Type':f.type||'application/octet-stream','X-Backup-Filename':f.name},body:raw});let text=await r.text();let data={};try{data=JSON.parse(text)}catch{data={detail:text}}if(!r.ok)throw new Error(data.detail||('HTTP '+r.status));alert((data.type==='json'?'JSON':'ZIP')+' 복원 완료\n인증키 '+(data.records||0)+'개 / 카테고리 '+(data.categories||0)+'개');await refresh()}catch(e){alert('백업 복원 실패: '+e.message)}finally{input.value=''}}
