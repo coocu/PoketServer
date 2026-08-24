@@ -831,6 +831,70 @@ def send_approval_push_to_full_admins(item: dict):
         return
 
 
+def send_admin_registration_push_to_full_admins(item: dict):
+    provider_token = _apns_provider_token()
+    if not provider_token:
+        return
+
+    targets = []
+    with _db_lock:
+        for record in apple_admins.values():
+            _normalize_apple_admin(record)
+            # 기존 인증키 승인 푸시와 동일하게 '전체' 권한 관리자만 대상입니다.
+            if record.get("allowedCategory") != "전체":
+                continue
+            for token_info in record.get("pushTokens", []):
+                token = str(token_info.get("token") or "").strip().lower()
+                env = str(token_info.get("environment") or "production").strip().lower()
+                if token:
+                    targets.append((token, "sandbox" if env == "sandbox" else "production"))
+
+    if not targets:
+        return
+
+    label = str(item.get("label") or "").strip()
+    body = f"{label}님의 관리자 권한 설정 요청이 있습니다." if label else "새로운 관리자 권한 설정 요청이 있습니다."
+    payload = {
+        "aps": {
+            "alert": {
+                "title": "인증 등록 요청",
+                "body": body,
+            },
+            "sound": "default",
+            "thread-id": "admin-registration-request",
+        },
+        "type": "admin_registration_request",
+        "adminUserId": str(item.get("userId") or ""),
+        "adminLabel": label,
+    }
+    headers = {
+        "authorization": f"bearer {provider_token}",
+        "apns-topic": APNS_BUNDLE_ID,
+        "apns-push-type": "alert",
+        "apns-priority": "10",
+        "content-type": "application/json",
+    }
+
+    try:
+        with httpx.Client(http2=True, timeout=10.0) as client:
+            for device_token, environment in targets:
+                host = "api.sandbox.push.apple.com" if environment == "sandbox" else "api.push.apple.com"
+                try:
+                    response = client.post(f"https://{host}/3/device/{device_token}", headers=headers, json=payload)
+                    if response.status_code in (400, 410):
+                        reason = ""
+                        try:
+                            reason = str(response.json().get("reason") or "")
+                        except Exception:
+                            pass
+                        if response.status_code == 410 or reason in ("BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"):
+                            _remove_stale_push_token(device_token)
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
 
 # Android 승인 알림 토큰은 운영 인증키 DB와 분리하여 저장합니다.
 def load_android_push_tokens():
@@ -1612,6 +1676,7 @@ def apple_admin_register(req: AppleAdminRegisterRequest):
     if not label:
         raise HTTPException(status_code=400, detail="label_required")
     validate_and_consume_kyh_code(req.code)
+    is_new_registration = False
     with _db_lock:
         if user_id not in apple_admins:
             apple_admins[user_id] = {
@@ -1620,10 +1685,20 @@ def apple_admin_register(req: AppleAdminRegisterRequest):
                 "registeredAt": now_kst().isoformat(timespec="seconds"),
                 "allowedCategory": None,
             }
+            is_new_registration = True
         else:
             apple_admins[user_id]["label"] = label
         save_apple_admins()
         profile = apple_admin_profile(user_id)
+
+    # 신규 관리자 등록일 때만 전체 권한 관리자에게 권한 설정 알림을 보냅니다.
+    if is_new_registration:
+        threading.Thread(
+            target=send_admin_registration_push_to_full_admins,
+            args=({"userId": user_id, "label": label},),
+            daemon=True,
+        ).start()
+
     return {"status": "ok", "sessionToken": issue_apple_session(user_id), "profile": profile}
 
 
