@@ -450,8 +450,7 @@ def validate_and_consume_kyh_code(code: str) -> dict:
         if data.get("deletedAt") or data.get("status") != "approved" or not data.get("enabled", True):
             raise HTTPException(status_code=401, detail="invalid_registration_code")
         if not _registration_code_uses_existing_exception_rule(code):
-            data["enabled"] = False
-            save_data()
+            deactivate_code_automatically(code)
         return dict(data)
 
 
@@ -831,6 +830,69 @@ def send_approval_push_to_full_admins(item: dict):
         return
 
 
+def send_auth_key_deactivation_push_to_full_admins(code: str):
+    provider_token = _apns_provider_token()
+    if not provider_token:
+        return
+
+    targets = []
+    seen_targets = set()
+    with _db_lock:
+        for record in apple_admins.values():
+            _normalize_apple_admin(record)
+            if record.get("allowedCategory") != "전체":
+                continue
+            for token_info in record.get("pushTokens", []):
+                token = str(token_info.get("token") or "").strip().lower()
+                environment = str(token_info.get("environment") or "production").strip().lower()
+                target = (token, "sandbox" if environment == "sandbox" else "production")
+                if token and target not in seen_targets:
+                    seen_targets.add(target)
+                    targets.append(target)
+
+    if not targets:
+        return
+
+    payload = {
+        "aps": {
+            "alert": {
+                "title": "인증키 비활성화",
+                "body": f"{code}가 비활성화 되었습니다",
+            },
+            "sound": "default",
+            "thread-id": "auth-key-deactivation",
+        },
+        "type": "auth_key_deactivation",
+        "code": code,
+    }
+    headers = {
+        "authorization": f"bearer {provider_token}",
+        "apns-topic": APNS_BUNDLE_ID,
+        "apns-push-type": "alert",
+        "apns-priority": "10",
+        "content-type": "application/json",
+    }
+
+    try:
+        with httpx.Client(http2=True, timeout=10.0) as client:
+            for device_token, environment in targets:
+                host = "api.sandbox.push.apple.com" if environment == "sandbox" else "api.push.apple.com"
+                try:
+                    response = client.post(f"https://{host}/3/device/{device_token}", headers=headers, json=payload)
+                    if response.status_code in (400, 410):
+                        reason = ""
+                        try:
+                            reason = str(response.json().get("reason") or "")
+                        except Exception:
+                            pass
+                        if response.status_code == 410 or reason in ("BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"):
+                            _remove_stale_push_token(device_token)
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
 def send_admin_registration_push_to_full_admins(item: dict):
     provider_token = _apns_provider_token()
     if not provider_token:
@@ -1157,6 +1219,25 @@ def deactivate_code(code: str):
         auth_db[code]["enabled"] = False
         save_data()
         return auth_db[code]
+
+
+def deactivate_code_automatically(code: str) -> bool:
+    with _db_lock:
+        data = auth_db.get(code)
+        if not data or not data.get("enabled", True):
+            return False
+        data["enabled"] = False
+        save_data()
+
+    try:
+        threading.Thread(
+            target=send_auth_key_deactivation_push_to_full_admins,
+            args=(code,),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
+    return True
 
 
 def set_category_for_code(code: str, category: str):
@@ -1637,8 +1718,7 @@ def app_check(req: CodeRequest):
             # - #으로 시작하는 인증키
             # 위 예외 인증키는 인증 후에도 활성 상태를 유지합니다.
             if code not in ALWAYS_ACTIVE_KEYS and not code.startswith("#"):
-                data["enabled"] = False
-                save_data()
+                deactivate_code_automatically(code)
 
             return result
 
@@ -1871,9 +1951,7 @@ def android_admin_login(req: CodeRequest):
     # 일반 인증키는 Android 로그인 성공 즉시 비활성화하고,
     # ALWAYS_ACTIVE_KEYS 및 #으로 시작하는 인증키는 기존처럼 활성 상태를 유지합니다.
     if not _registration_code_uses_existing_exception_rule(code):
-        with _db_lock:
-            auth_db[code]["enabled"] = False
-            save_data()
+        deactivate_code_automatically(code)
 
     return {"status": "ok", "sessionToken": session_token, "profile": profile}
 
