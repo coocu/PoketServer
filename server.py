@@ -218,6 +218,7 @@ def _normalize_approval_request(record: dict) -> dict:
     item.setdefault("requestId", "")
     item.setdefault("requestedAt", now_kst().isoformat(timespec="seconds"))
     item.setdefault("requesterUserId", "")
+    item.setdefault("requesterPlatform", "")
     item.setdefault("requesterLabel", "")
     item.setdefault("name", "")
     item.setdefault("phoneLast4", "")
@@ -663,6 +664,7 @@ def create_approval_request(user_id: str, profile: dict, req: AppleAdminUploadRe
             "requestId": request_id,
             "requestedAt": now_kst().isoformat(timespec="seconds"),
             "requesterUserId": user_id,
+            "requesterPlatform": "android" if profile.get("sourceCode") else "apple",
             "requesterLabel": str(profile.get("label") or profile.get("name") or ""),
             "name": (req.name or "").strip(),
             "phoneLast4": req.phoneLast4,
@@ -689,15 +691,22 @@ def approve_pending_request(request_id: str) -> dict:
         if item.get("code") in auth_db:
             raise HTTPException(status_code=409, detail="code_already_exists")
 
-    # 기존 서버 등록 순서를 그대로 재사용합니다.
-    register(RegisterRequest(name=item.get("name", ""), phoneLast4=item.get("phoneLast4", ""), code=item.get("code", "")))
-    approve(CodeRequest(code=item.get("code", "")))
-    set_delete_pwd(PasswordRequest(password=_effective_delete_password(item.get("deletePassword")), code=item.get("code", "")))
-    set_category_for_code(item.get("code", ""), clean_category(item.get("category")))
-
-    with _db_lock:
+        # 승인 처리와 대기 목록 제거를 하나의 임계 구역으로 묶어 중복 승인을 막습니다.
+        register(RegisterRequest(name=item.get("name", ""), phoneLast4=item.get("phoneLast4", ""), code=item.get("code", "")))
+        approve(CodeRequest(code=item.get("code", "")))
+        set_delete_pwd(PasswordRequest(password=_effective_delete_password(item.get("deletePassword")), code=item.get("code", "")))
+        set_category_for_code(item.get("code", ""), clean_category(item.get("category")))
         approval_requests.pop(request_id, None)
         save_approval_requests()
+
+    try:
+        threading.Thread(
+            target=send_approval_result_push_to_requester,
+            args=(dict(item),),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
     return item
 
 
@@ -1101,6 +1110,115 @@ def send_android_approval_push_to_full_admins(item: dict):
             continue
 
 
+def send_approval_result_push_to_requester(item: dict):
+    requester_id = str(item.get("requesterUserId") or "").strip()
+    if not requester_id:
+        return
+
+    platform = str(item.get("requesterPlatform") or "").strip().lower()
+    if platform not in ("apple", "android"):
+        with _db_lock:
+            if requester_id in apple_admins:
+                platform = "apple"
+            elif requester_id in android_push_tokens:
+                platform = "android"
+            else:
+                return
+
+    code = str(item.get("code") or "").strip()
+    title = "인증키 승인 완료"
+    body = f"{code}가 승인되었습니다"
+
+    if platform == "apple":
+        provider_token = _apns_provider_token()
+        if not provider_token:
+            return
+
+        with _db_lock:
+            record = apple_admins.get(requester_id)
+            if not record:
+                return
+            _normalize_apple_admin(record)
+            targets = []
+            for token_info in record.get("pushTokens", []):
+                token = str(token_info.get("token") or "").strip().lower()
+                environment = str(token_info.get("environment") or "production").strip().lower()
+                if token:
+                    targets.append((token, "sandbox" if environment == "sandbox" else "production"))
+
+        payload = {
+            "aps": {
+                "alert": {"title": title, "body": body},
+                "sound": "default",
+                "thread-id": "auth-upload-approved",
+            },
+            "type": "auth_upload_approved",
+            "code": code,
+        }
+        headers = {
+            "authorization": f"bearer {provider_token}",
+            "apns-topic": APNS_BUNDLE_ID,
+            "apns-push-type": "alert",
+            "apns-priority": "10",
+            "content-type": "application/json",
+        }
+
+        try:
+            with httpx.Client(http2=True, timeout=10.0) as client:
+                for device_token, environment in list(dict.fromkeys(targets)):
+                    host = "api.sandbox.push.apple.com" if environment == "sandbox" else "api.push.apple.com"
+                    try:
+                        response = client.post(f"https://{host}/3/device/{device_token}", headers=headers, json=payload)
+                        if response.status_code in (400, 410):
+                            reason = ""
+                            try:
+                                reason = str(response.json().get("reason") or "")
+                            except Exception:
+                                pass
+                            if response.status_code == 410 or reason in ("BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"):
+                                _remove_stale_push_token(device_token)
+                    except Exception:
+                        continue
+        except Exception:
+            return
+        return
+
+    access_token = _fcm_access_token()
+    account = _fcm_service_account()
+    project_id = FCM_PROJECT_ID or (str(account.get("project_id") or "").strip() if account else "")
+    if not access_token or not project_id:
+        return
+    with _db_lock:
+        targets = list(dict.fromkeys(android_push_tokens.get(requester_id, [])))
+    if not targets:
+        return
+
+    url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    data = {
+        "type": "auth_upload_approved",
+        "title": title,
+        "body": body,
+        "code": code,
+    }
+    for target in targets:
+        payload = {
+            "message": {
+                "token": target,
+                "data": data,
+                "android": {"priority": "high"},
+            }
+        }
+        try:
+            response = httpx.post(url, headers=headers, json=payload, timeout=10.0)
+            if response.status_code in (400, 404):
+                response_body = response.text
+                if "UNREGISTERED" in response_body or "registration-token-not-registered" in response_body:
+                    _remove_stale_android_push_token(target)
+        except Exception:
+            continue
+
+
 @app.get("/android-admin/push-config")
 def android_push_config(request: Request):
     require_android_session(request)
@@ -1114,14 +1232,18 @@ def android_push_config(request: Request):
 
 @app.post("/android-admin/push-token")
 def android_push_token(req: AndroidPushTokenRequest, request: Request):
-    source_code, profile = require_android_session(request)
-    if profile.get("allowedCategory") != "전체":
-        raise HTTPException(status_code=403, detail="full_permission_required")
+    source_code, _ = require_android_session(request)
     token = (req.deviceToken or "").strip()
     if not token:
         raise HTTPException(status_code=400, detail="invalid_device_token")
     with _db_lock:
-        tokens = [x for x in android_push_tokens.get(source_code, []) if x != token]
+        for registered_code in list(android_push_tokens.keys()):
+            remaining = [x for x in android_push_tokens.get(registered_code, []) if x != token]
+            if remaining:
+                android_push_tokens[registered_code] = remaining
+            else:
+                android_push_tokens.pop(registered_code, None)
+        tokens = list(android_push_tokens.get(source_code, []))
         tokens.append(token)
         android_push_tokens[source_code] = tokens[-5:]
         save_android_push_tokens()
@@ -1851,8 +1973,12 @@ def apple_admin_push_token(req: ApplePushTokenRequest, request: Request):
         record = apple_admins.get(user_id)
         if not record:
             raise HTTPException(status_code=401, detail="apple_admin_not_registered")
-        _normalize_apple_admin(record)
-        record["pushTokens"] = [x for x in record.get("pushTokens", []) if x.get("token") != token]
+        for admin_record in apple_admins.values():
+            _normalize_apple_admin(admin_record)
+            admin_record["pushTokens"] = [
+                x for x in admin_record.get("pushTokens", []) if x.get("token") != token
+            ]
+        record = apple_admins[user_id]
         record["pushTokens"].append({
             "token": token,
             "environment": environment,
