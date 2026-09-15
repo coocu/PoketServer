@@ -1066,6 +1066,96 @@ def _remove_stale_android_push_token(token: str):
             save_android_push_tokens()
 
 
+def send_android_auth_key_deactivation_push_to_full_admins(code: str):
+    access_token = _fcm_access_token()
+    account = _fcm_service_account()
+    project_id = FCM_PROJECT_ID or (str(account.get("project_id") or "").strip() if account else "")
+    if not access_token or not project_id:
+        return
+    with _db_lock:
+        targets = []
+        for source_code, tokens in android_push_tokens.items():
+            try:
+                profile = android_admin_profile_for_code(source_code, require_enabled=False)
+            except HTTPException:
+                continue
+            if profile.get("allowedCategory") == "전체":
+                targets.extend(tokens)
+    if not targets:
+        return
+    url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    data = {
+        "type": "auth_key_deactivation",
+        "title": "인증키 비활성화",
+        "body": f"{code}가 비활성화 되었습니다",
+        "code": code,
+    }
+    for target in list(dict.fromkeys(targets)):
+        payload = {
+            "message": {
+                "token": target,
+                "data": data,
+                "android": {"priority": "high"},
+            }
+        }
+        try:
+            response = httpx.post(url, headers=headers, json=payload, timeout=10.0)
+            if response.status_code in (400, 404):
+                body = response.text
+                if "UNREGISTERED" in body or "registration-token-not-registered" in body:
+                    _remove_stale_android_push_token(target)
+        except Exception:
+            continue
+
+
+def send_android_admin_registration_push_to_full_admins(item: dict):
+    access_token = _fcm_access_token()
+    account = _fcm_service_account()
+    project_id = FCM_PROJECT_ID or (str(account.get("project_id") or "").strip() if account else "")
+    if not access_token or not project_id:
+        return
+    with _db_lock:
+        targets = []
+        for source_code, tokens in android_push_tokens.items():
+            try:
+                profile = android_admin_profile_for_code(source_code, require_enabled=False)
+            except HTTPException:
+                continue
+            if profile.get("allowedCategory") == "전체":
+                targets.extend(tokens)
+    if not targets:
+        return
+
+    label = str(item.get("label") or "").strip()
+    body = f"{label}님의 관리자 권한 설정 요청이 있습니다." if label else "새로운 관리자 권한 설정 요청이 있습니다."
+    url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    data = {
+        "type": "admin_registration_request",
+        "title": "인증 등록 요청",
+        "body": body,
+        "adminUserId": str(item.get("userId") or ""),
+        "adminLabel": label,
+    }
+    for target in list(dict.fromkeys(targets)):
+        payload = {
+            "message": {
+                "token": target,
+                "data": data,
+                "android": {"priority": "high"},
+            }
+        }
+        try:
+            response = httpx.post(url, headers=headers, json=payload, timeout=10.0)
+            if response.status_code in (400, 404):
+                body_text = response.text
+                if "UNREGISTERED" in body_text or "registration-token-not-registered" in body_text:
+                    _remove_stale_android_push_token(target)
+        except Exception:
+            continue
+
+
 def send_android_approval_push_to_full_admins(item: dict):
     access_token = _fcm_access_token()
     account = _fcm_service_account()
@@ -1338,9 +1428,21 @@ def deactivate_code(code: str):
     with _db_lock:
         if code not in auth_db:
             raise HTTPException(status_code=404, detail="code_not_found")
+        was_enabled = bool(auth_db[code].get("enabled", True))
         auth_db[code]["enabled"] = False
         save_data()
-        return auth_db[code]
+        result = auth_db[code]
+
+    if was_enabled:
+        try:
+            threading.Thread(
+                target=send_android_auth_key_deactivation_push_to_full_admins,
+                args=(code,),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+    return result
 
 
 def deactivate_code_automatically(code: str) -> bool:
@@ -1354,6 +1456,11 @@ def deactivate_code_automatically(code: str) -> bool:
     try:
         threading.Thread(
             target=send_auth_key_deactivation_push_to_full_admins,
+            args=(code,),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=send_android_auth_key_deactivation_push_to_full_admins,
             args=(code,),
             daemon=True,
         ).start()
@@ -1897,6 +2004,11 @@ def apple_admin_register(req: AppleAdminRegisterRequest):
     if is_new_registration:
         threading.Thread(
             target=send_admin_registration_push_to_full_admins,
+            args=({"userId": user_id, "label": label},),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=send_android_admin_registration_push_to_full_admins,
             args=({"userId": user_id, "label": label},),
             daemon=True,
         ).start()
